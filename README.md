@@ -79,8 +79,9 @@ Other editions of The Sims (the original discs, the Complete Collection) have no
 
    When the copy is done, close VitaShell's USB connection screen before starting the game.
 4. **Install the VPK:** copy it to the Vita (e.g. to `ux0:`), open it in VitaShell and press **✕**.
-5. **Start it** from its bubble. The **first start indexes the game's files and takes a few
-   minutes**; later starts are quick.
+5. **Start it** from its bubble. The **first start indexes the game's files: about 5 minutes**,
+   with a loading screen. Later starts are quick. (It indexes again, once, whenever the files in
+   `ux0:data/TheSims` change, e.g. after copying in a folder you'd missed.)
 
 ## Updating
 
@@ -148,7 +149,8 @@ original setting unless you change it; **Set to Default** puts them all back.
 - **"The Sims' files weren't found in ux0:data/TheSims":** the game's folders aren't where the
   app looks. `ux0:data/TheSims/GameData/UIText.iff` must exist (not
   `ux0:data/TheSims/The Sims Legacy Collection/GameData/...`).
-- **The first start seems stuck:** indexing takes a few minutes from a memory card. Leave it.
+- **The first start seems stuck:** indexing the game's files takes about 5 minutes from a memory
+  card (and again after they change). Leave it running.
 - **Added custom content doesn't show up:** restart the app; added content is read at start.
 
 ## Reporting a problem
