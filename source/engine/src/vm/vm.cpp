@@ -557,6 +557,10 @@ Vm::Vm(Content &c, Lot &l, Neighborhood *h, int house_number, CharacterLibrary *
     // interactions on, this house.
     for (size_t i = 0; i < lot.simi.globals.size() && i < globals.size(); i++)
         globals[i] = lot.simi.globals[i];
+    // The Budget window's books from the lot (a save, read later, has its own; a move-in clears them).
+    std::copy(lot.simi.books[0], lot.simi.books[0] + 8, book_today);
+    for (int d = 0; d < 5; d++)
+        std::copy(lot.simi.books[d + 1], lot.simi.books[d + 1] + 8, book_days[d]);
     globals[20] = 255;
     globals[25] = 4;
     // 17 and 19 as the exe has them in live play (its step, FUN_00557a00, stops the clock while 17 is
@@ -1733,6 +1737,12 @@ void Vm::move_in(int16_t family_id)
         return;
     if (globals.size() > 9)
         globals[9] = fam->id;   // (the exe's next lot load would; see set_family_global)
+    // The Budget window's books afresh and Days Since Move-In (global 28) 0, as the exe's first load after a
+    // move-in (FUN_00556620 from FUN_0054eb20).
+    std::fill(&book_today[0], &book_today[0] + 8, 0);
+    std::fill(&book_days[0][0], &book_days[0][0] + 5 * 8, 0);
+    if (globals.size() > 28)
+        globals[28] = 0;
     // By the mailbox, a tile towards the road (FreeSims VMNetSimJoinCmd: the mailbox's position
     // + 1, + 1), as the game's: the pedestrian portals sit at the lot's far corners (the Goths':
     // (41, 50) and (41, 1)), and a family placed at one stood a long way down the pavement (the

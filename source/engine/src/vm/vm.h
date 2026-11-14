@@ -1177,6 +1177,23 @@ public:
     // (the bar 0 until the days fill). At midnight slot 0 is copied into 1-4 (the original's) and today
     // into 0. Saved with the lot (save version 19).
     int layout_t[6] = { 200, 200, 200, 200, 200, 200 }, layout_b[6] = { 200, 200, 200, 200, 200, 200 };
+    // The Budget window's books (the exe's household +0x184 today, +0xe4 the days before; FUN_00557960
+    // books every payment): 8 kinds, an expense positive, income negative: 0 miscellaneous expenses,
+    // 1 job, 2 miscellaneous income, 3 food, 4 bills, 5 repair/cleaning/gardening, 6 household items,
+    // 7 architecture/landscaping. At midnight today goes into the days before (new_day). Kept with the lot.
+    enum BookKind { kBookMisc = 0, kBookJob = 1, kBookMiscIncome = 2, kBookFood = 3, kBookBills = 4, kBookService = 5,
+                    kBookItems = 6, kBookArchitecture = 7 };
+    int32_t book_today[8] = {};
+    int32_t book_days[5][8] = {};
+    // A payment (positive) or income (negative) booked under its kind; not on a lot without a family's money.
+    void book(int kind, int32_t amount)
+    {
+        if (kind >= 0 && kind < 8 && !free_money())
+            book_today[kind] += amount;
+    }
+    // A purchase in buy or build mode: architecture if the thing is built (its OBJD build mode type), household
+    // items otherwise (the exe's buy tool, FUN_0056f560); `refund` books it back.
+    void book_purchase(const Entity *obj, int32_t price);
     bool sell(Entity *obj, std::string &why);
     // The house bulldozed to an empty lot, as the original's (0x54f6e0): what players may delete
     // off (things on the street kept), every wall, every floor but the street's; the terrain stays.

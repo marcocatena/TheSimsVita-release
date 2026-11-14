@@ -202,6 +202,11 @@ bool parse_simi(const uint8_t *data, size_t size, Simi &out, std::string &error)
     out.lot_value = r.s32le();
     out.objects_value = r.s32le();
     out.architecture_value = r.s32le();
+    for (int d = 0; d < 6 && r.remaining() >= 36; d++) {
+        r.s32le();   // (kept: 1)
+        for (int32_t &v : out.books[d])
+            v = r.s32le();
+    }
     return check(r, error);
 }
 

@@ -392,6 +392,15 @@ std::string Vm::placement_problem_of(Entity *lead, int tx, int ty, int level, in
                     return "Someone is in the way";
                 continue;
             }
+            // A door or window (a portal's parts sit on the floor tiles either side, their footprint the
+            // whole tile) doesn't keep out what the game's code makes in play: a broken sink facing a
+            // doorway made no puddle at all, "Something is in the way" (Lisa's kitchen sink, the user's
+            // main Vita, 2026-11-14). The exe leaves portals out of its object loops (FUN_005396b0) and
+            // puddles do lie in doorways in the original. (Buy mode's placement unchanged.)
+            // TS_CREATE_PORTAL_OLD=1: as before.
+            static const bool portal_old = TS_ENV("TS_CREATE_PORTAL_OLD") != nullptr;
+            if (in_play && !portal_old && (uint16_t(o.value(VarFlagField2)) & ((1 << 14) | (1 << 15))))
+                continue;
             const bool theirs_flat = (uint16_t(o.value(VarFlags)) & FlagHasZeroExtent) != 0;
             if (place_old) {
                 // No extent, no footprint (FreeSO: such an object has no obstacle): a window's inside
@@ -402,8 +411,14 @@ std::string Vm::placement_problem_of(Entity *lead, int tx, int ty, int level, in
             } else if (mine_flat || theirs_flat) {
                 if (!here)
                     continue;
-                if (part->value(kVarExclusivePlacementFlags) & o.value(kVarExclusivePlacementFlags) & 1)
+                if (part->value(kVarExclusivePlacementFlags) & o.value(kVarExclusivePlacementFlags) & 1) {
+                    if (TS_ENV("TS_CREATE"))   // debug: which object, and both exclusive-placement values
+                        std::printf("  in the way: #%d %s (exclusive %d, flags 0x%x, dir %d) against %s (exclusive %d, flat %d)\n", int(o.id),
+                                    o.info ? o.info->label.c_str() : "?", int(o.value(kVarExclusivePlacementFlags)),
+                                    unsigned(uint16_t(o.value(VarFlags))), int(o.direction), part->info ? part->info->label.c_str() : "?",
+                                    int(part->value(kVarExclusivePlacementFlags)), int(mine_flat));
                     return "Something is in the way";
+                }
                 if (mine_flat && theirs_flat) {
                     const int a = wall_side(*part, direction), b = wall_side(o, o.direction);
                     if (a != 0 && a == b)
@@ -416,6 +431,13 @@ std::string Vm::placement_problem_of(Entity *lead, int tx, int ty, int level, in
                 continue;
             if (!place_old && !mine_rect.overlaps(footprint(o, o.x16, o.y16, o.direction)))
                 continue;
+            if (TS_ENV("TS_CREATE")) {   // debug: what's in the way, both footprints
+                const Footprint t = footprint(o, o.x16, o.y16, o.direction);
+                std::printf("  in the way: #%d %s (flags 0x%x, dir %d) box %d..%d, %d..%d; %s's box %d..%d, %d..%d\n", int(o.id),
+                            o.info ? o.info->label.c_str() : "?", unsigned(uint16_t(o.value(VarFlags))), int(o.direction), t.x0,
+                            t.x1, t.y0, t.y1, part->info ? part->info->label.c_str() : "?", mine_rect.x0, mine_rect.x1, mine_rect.y0,
+                            mine_rect.y1);
+            }
             problem = "Something is in the way";
             if (TS_ENV("TS_PLACEDBG"))   // debug: what's in the way
                 std::printf("placement: #%d %s in the way at (%d, %d) level %d (x16 %d, %d; container %d; parent %d)%s\n", int(o.id),
@@ -603,22 +625,29 @@ std::string Vm::movable_problem(Entity *obj, bool selling)
         return "Nothing there";
     if (obj->person)
         return "That's a Sim";
+    // Where it stands: not on a tile outside the lot's editable area (the exe's pick-up test FUN_0053ee40:
+    // the object's tile's editable bit, bit 5 of the lot's tile flags, unless move_objects; its message 0x27,
+    // PlacementErrs 38). The mailbox by the road, the outdoor trash can, the phone line stay put, as the
+    // original's; ours let the mailbox be picked up (the user, 2026-11-14). TS_PICKUP_BOUNDS_OLD=1: as before.
+    static const bool bounds_old = TS_ENV("TS_PICKUP_BOUNDS_OLD") != nullptr;
+    if (!bounds_old && !move_objects && obj->in_world() && obj->level >= 1 && !lot.user_tile(obj->tile_x(), obj->tile_y(), false))
+        return "Can't pick up--location out of bounds.";
     for (Entity *part : parts_of(obj)) {
         const int movement = part->value(VarMovementFlags);
         if (TS_ENV("TS_MOVE_WHY"))   // debug: the movement flags looked at
             std::printf("movable: #%d %s movement flags %d\n", int(part->id), part->info ? part->info->label.c_str() : "?",
                         movement);
         if (!(movement & kPlayersCanMove) && !move_objects)
-            return "That can't be moved";
+            return "Can't pick up";   // (the original's words, PlacementErrs 36)
         if (selling && !(movement & kPlayersCanDelete) && !move_objects)
             return "That can't be sold";
         if (part->flag(FlagOccupied))
-            return "Someone is using it";
+            return "Can't select object in use";
         for (auto &up : entities)
             if (up->person && !up->dead && up->thread)
                 for (const Frame &f : up->thread->stack)
                     if (f.callee == part)
-                        return "Someone is using it";
+                        return "Can't select object in use";
         for (Entity *s : part->slots)
             if (s && (selling || s->person || !movable_problem(s, false).empty()))
                 return "Take what's on it off first";
@@ -684,6 +713,7 @@ bool Vm::place_held(int tx, int ty, int level, int direction, std::string &why)
         lot_version++;   // the walls get its hole
     if (held.bought) {
         add_money(-held.price);
+        book_purchase(obj, held.price);
         bought[obj->id] = { held.price, day_number() };
         for (Entity *part : parts_of(obj)) {
             // Born today (FreeSO VMContext.SetBirthTime), then main on its thread.
@@ -850,6 +880,15 @@ Vm::HouseStats Vm::house_stats() const
 
 void Vm::new_day()
 {
+    {   // the Budget window's books and Days Since Move-In, as the exe's clock at midnight (FUN_005576f0): global 28
+        // up a day; today into the days before (the exe copies yesterday into all four older slots, a slip the
+        // window never shows: it reads today and the two days before).
+        globals[28] = int16_t(globals[28] + 1);
+        for (int d = 4; d > 0; d--)
+            std::copy(book_days[d - 1], book_days[d - 1] + 8, book_days[d]);
+        std::copy(book_today, book_today + 8, book_days[0]);
+        std::fill(book_today, book_today + 8, 0);
+    }
     {   // the Layout bar's days (FUN_0056aef0): slot 0 into 1-4 (the original's shift), today into 0
         const int t0 = layout_t[0], b0 = layout_b[0];
         for (int i = 1; i <= 4; i++) {
@@ -1060,7 +1099,14 @@ bool Vm::sell(Entity *obj, std::string &why)
         neighbours_changed(*this, x, y, level, guid);
     bought.erase(obj->id);
     add_money(value);
+    book_purchase(obj, -value);   // (a refund: the exe's FUN_005901b0)
     return true;
+}
+
+void Vm::book_purchase(const Entity *obj, int32_t price)
+{
+    const ObjectInfo *info = obj ? (obj->master ? obj->master : obj->info) : nullptr;
+    book(info && info->objd.get(Objd::BuildModeType) != 0 ? kBookArchitecture : kBookItems, price);
 }
 
 void Vm::bulldoze()

@@ -577,6 +577,7 @@ int Vm::shape_terrain(int x0, int y0, int x1, int y1, int how, std::string &why)
         h = uint8_t(how > 0 ? h + 1 : how < 0 ? h - 1 : target);
     }
     add_money(-cost);
+    book(kBookArchitecture, cost);
     lot_edited();
     return std::max(cost, 1);
 }
@@ -607,6 +608,7 @@ int Vm::paint_grass(int x0, int y0, int x1, int y1, bool grow, std::string &why)
     for (size_t i : change)
         lot.grass[i] = want;
     add_money(-cost);
+    book(kBookArchitecture, cost);
     lot_edited();
     return std::max(cost, 1);
 }
@@ -704,6 +706,7 @@ int Vm::build_pool(int x0, int y0, int x1, int y1, int level, const BuildItem &i
     for (auto [x, y] : tiles)
         floor_at(lot, x, y, l) = erase ? 0 : item.pattern;
     add_money(-cost);
+    book(kBookArchitecture, cost);
     lot_edited();
     return std::max(cost, 1);
 }
@@ -825,18 +828,25 @@ int Vm::build_floor(int x0, int y0, int x1, int y1, int level, const BuildItem *
         floor_at(lot, x, y, l) = pattern ? kFloorDiagonal : 0;
     }
     add_money(-cost);
+    book(kBookArchitecture, cost);
     lot_edited();
     return std::max(cost, 1);
 }
 
 namespace {
 
-// Whether something needs the wall on the west (vertical) or north edge of
-// tile (x, y): a door, window or picture hung on it, from either side.
-bool wall_in_use(Vm &vm, int x, int y, int level, bool vertical)
+// What needs the wall on the west (vertical) or north edge of tile (x, y): a door, window or
+// picture hung on it, from either side (each object once, by its lead part).
+std::vector<Entity *> wall_users(Vm &vm, int x, int y, int level, bool vertical)
 {
+    std::vector<Entity *> out;
+    auto add = [&](Entity *e) {
+        e = e->group.empty() ? e : e->group[0];   // (one entry an object: Vm::sell takes it whole from any part)
+        if (std::find(out.begin(), out.end(), e) == out.end())
+            out.push_back(e);
+    };
     for (auto &up : vm.entities) {
-        const Entity &e = *up;
+        Entity &e = *up;
         if (e.dead || e.person || !e.in_world() || e.container || e.level != level)
             continue;
         const int needs = e.value(VarWallPlacementFlags) & 15;
@@ -845,11 +855,11 @@ bool wall_in_use(Vm &vm, int x, int y, int level, bool vertical)
         const int sides = rotate_sides(needs, (8 - ((e.direction / 2) + 1)) % 4);   // in the tile's own terms
         const int ex = e.tile_x(), ey = e.tile_y();
         if (vertical && ((ex == x && ey == y && (sides & WallTopLeft)) || (ex == x - 1 && ey == y && (sides & WallBottomRight))))
-            return true;
+            add(&e);
         if (!vertical && ((ex == x && ey == y && (sides & WallTopRight)) || (ex == x && ey == y - 1 && (sides & WallBottomLeft))))
-            return true;
+            add(&e);
     }
-    return false;
+    return out;
 }
 
 // Whether one object stands on both sides of the edge (a wall can't cut it).
@@ -899,6 +909,11 @@ int Vm::build_walls(int x0, int y0, int x1, int y1, int level, const BuildItem &
             pattern = t.pattern;
     // Each unit of the run: tile (x, y) is the one whose west or north edge it is.
     std::vector<std::pair<int, int>> edges;
+    // Erasing: what hangs on those walls (doors, windows, pictures) is sold with them, as the original
+    // (the user, 2026-11-14: "it should delete the wall and sell the window"); refused only if one of
+    // them can't be sold. Ours refused the wall. TS_WALL_ERASE_OLD=1: refused, as before.
+    static const bool erase_old = TS_ENV("TS_WALL_ERASE_OLD") != nullptr;
+    std::vector<Entity *> hung;
     for (int i = std::max(a, 0); i < std::min(b, lot.size); i++) {
         const int x = vertical ? line : i, y = vertical ? i : line;
         const WallTile &w = wall_at(lot, x, y, l);
@@ -906,9 +921,13 @@ int Vm::build_walls(int x0, int y0, int x1, int y1, int level, const BuildItem &
         if (erase ? !there : there)
             continue;
         if (erase) {
-            if (wall_in_use(*this, x, y, level, vertical)) {
-                why = "Something is on that wall";
-                return -1;
+            for (Entity *e : wall_users(*this, x, y, level, vertical)) {
+                if (erase_old || !movable_problem(e, true).empty()) {
+                    why = "Something is on that wall";
+                    return -1;
+                }
+                if (std::find(hung.begin(), hung.end(), e) == hung.end())
+                    hung.push_back(e);
             }
         } else {
             // Both tiles either side of the wall editable (the exe's FUN_00639120): no wall on the
@@ -955,6 +974,10 @@ int Vm::build_walls(int x0, int y0, int x1, int y1, int level, const BuildItem &
         why = "Not enough money";
         return -1;
     }
+    for (Entity *e : hung) {   // (sold first: their own code sees the wall they hang on)
+        std::string not_sold;
+        sell(e, not_sold);
+    }
     for (auto [x, y] : edges) {
         WallTile &w = wall_at(lot, x, y, l);
         WallTile &other = wall_at(lot, vertical ? x - 1 : x, vertical ? y : y - 1, l);
@@ -983,6 +1006,7 @@ int Vm::build_walls(int x0, int y0, int x1, int y1, int level, const BuildItem &
         }
     }
     add_money(-cost);
+    book(kBookArchitecture, cost);
     lot_edited();
     return std::max(cost, 1);
 }
@@ -1071,6 +1095,7 @@ int Vm::build_diagonal(int x0, int y0, int x1, int y1, int level, const BuildIte
         }
     }
     add_money(-cost);
+    book(kBookArchitecture, cost);
     lot_edited();
     return std::max(cost, 1);
 }
@@ -1165,6 +1190,7 @@ int Vm::fill_floor(int x, int y, int level, const BuildItem *item, std::string &
         floor_at(lot, tx, ty, l) = (w.top_left_pattern || w.top_left_style) ? kFloorDiagonal : 0;
     }
     add_money(-cost);
+    book(kBookArchitecture, cost);
     lot_edited();
     return std::max(cost, 1);
 }
@@ -1308,6 +1334,7 @@ int Vm::build_wallpaper(int x, int y, int level, int edge, const BuildItem &item
     }
     *field = pattern;
     add_money(-item.price);
+    book(kBookArchitecture, item.price);
     lot_edited();
     return std::max(item.price, 1);
 }

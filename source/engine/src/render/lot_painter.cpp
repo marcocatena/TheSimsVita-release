@@ -60,8 +60,20 @@ void draw_floor_sprite(DrawList &out, const Projector &p, Content &content, Spri
     p.point(float(x), float(y), z, cx, cy);
     float bx, by;
     p.box(float(x), float(y), z, bx, by);
-    const DepthPlane depth =
-        floor_depth(back_corner_depth(p, float(x), float(y), z), p.m.zoom_index, float(int(by) + p.m.floor_y));
+    // A floor sits a few z-buffer steps behind its own plane, so what lies on it wins the ties: a rug's
+    // own z-buffer runs along the floor's plane a step either side, and the floor came through it in
+    // a speckle of tiles and grout (the Scraps Ranch Rag Rug in Lisa's kitchen, the user, 2026-11-14).
+    // (A higher start is further back; the wall caps sit 2 behind for the same reason. The rug was solid
+    // from 2; the puddles' joins, a line of floor between two water tiles (the user's shot, 2026-11-14),
+    // closed only from 8.) Not the pool's or a pond's water: swimmers sink into it by its depth.
+    // TS_FLOOR_BIAS=<steps> to try others (0: as before).
+    static const float floor_bias = [] {
+        const char *b = TS_ENV("TS_FLOOR_BIAS");
+        return b ? float(std::atof(b)) : 8.0f;
+    }();
+    const bool water = pattern == kFloorPool || pattern == kFloorWater;
+    const DepthPlane depth = floor_depth(back_corner_depth(p, float(x), float(y), z), p.m.zoom_index,
+                                         float(int(by) + p.m.floor_y), water ? 255.0f : 255.0f + floor_bias);
     if (pattern == kFloorPool || pattern == kFloorWater) {
         // (The lot's outermost row is past the edge of its ground: the Kats' file has water all along one side.)
         if (x <= 0 || y <= 0 || x >= lot.size - 1 || y >= lot.size - 1)

@@ -4133,6 +4133,7 @@ Exit transfer_funds(Frame &f, const uint8_t *op)
         return Exit::GotoFalse;
     if (!(flags & 1)) {
         budget -= amount;
+        vm.book(op[6], amount);   // the Budget window's books, under the kind byte 6 names (FUN_00557960)
         // The amount over the payer's head, as the original shows it (the user, 2026-11-06: the till
         // rang with nothing shown). Only on a lot with a family's money at stake.
         if (amount != 0 && !vm.free_money() && f.caller && f.caller->in_world() && vm.money_shown.size() < 32)

@@ -70,6 +70,10 @@ struct Simi {
     uint32_t version = 0;
     std::vector<int16_t> globals;   // 32 or 64; [23] = lot size, [35] = lot type
     int32_t lot_value = 0, objects_value = 0, architecture_value = 0;
+    // The Budget window's books, as the exe keeps them after the values: 6 days (today, then the days before),
+    // each a "kept" word and the 8 kinds (Vm::BookKind), expenses positive. The shipped lots hold Maxis'
+    // building spending (the Newbies' house: household items 6,099, architecture 2,215).
+    int32_t books[6][8] = {};
 };
 
 bool parse_simi(const uint8_t *data, size_t size, Simi &out, std::string &error);
