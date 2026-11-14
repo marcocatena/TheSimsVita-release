@@ -61,22 +61,16 @@ Other editions of The Sims (the original discs, the Complete Collection) have no
 
 ## Installing
 
-1. **Download** `TheSimsVita-vX.Y.vpk` and `copy_to_vita.cmd` from the
-   [latest release](../../releases/latest).
+1. **Download** `TheSimsVita-vX.Y.vpk` from the [latest release](../../releases/latest).
 2. **Find your game's install folder** on the PC. In Steam: right-click The Sims Legacy Collection ›
    Manage › Browse local files. Usually
    `C:\Program Files (x86)\Steam\steamapps\common\The Sims Legacy Collection`.
-3. **Copy the game's files to the Vita**, to `ux0:data/TheSims/`:
-   - **On Windows:** start VitaShell on the Vita and press **SELECT** (USB mode); the Vita's memory
-     card shows up as a drive on the PC. Then run `copy_to_vita.cmd` with that drive's letter and your
-     install folder, for example:
-     ```
-     copy_to_vita.cmd E "C:\Program Files (x86)\Steam\steamapps\common\The Sims Legacy Collection"
-     ```
-   - **By hand (any computer, USB or FTP):** copy these folders from the install folder into
-     `ux0:data/TheSims/`, keeping their names. Copy whichever exist:
-     `GameData`, `SoundData`, `Music`, `UIGraphics`, `ExpansionShared`, `ExpansionPack`,
-     `ExpansionPack2` … `ExpansionPack7`, `Deluxe`, `Downloads`, `UserData`, `UserData2` … `UserData8`.
+3. **Copy the game's files to the Vita**, to `ux0:data/TheSims/`. Connect the Vita with VitaShell:
+   press **SELECT** for USB mode and the memory card shows up as a drive on the PC (VitaShell's
+   settings can turn SELECT to FTP instead, for copying over Wi-Fi).
+   Copy these folders from the install folder into `ux0:data/TheSims/`, keeping their names, whichever
+   exist: `GameData`, `SoundData`, `Music`, `UIGraphics`, `ExpansionShared`, `ExpansionPack`,
+   `ExpansionPack2` … `ExpansionPack7`, `Deluxe`, `Downloads`, `UserData`, `UserData2` … `UserData8`.
 
    Check: the file `ux0:data/TheSims/GameData/UIText.iff` must exist.
 4. **Install the VPK:** copy it to the Vita (e.g. to `ux0:`), open it in VitaShell and press **✕**.
