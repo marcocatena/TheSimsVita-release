@@ -8,7 +8,7 @@ objects.
 The download contains no game data: you copy the folders from your own install of
 **The Sims Legacy Collection** to the Vita's memory card.
 
-> Work in progress. Expect bugs and missing pieces; please report what you find
+> First public release, tested on two Vitas so far. If something doesn't work, please report it
 > (see [Reporting a problem](#reporting-a-problem)).
 
 ## Screenshots
