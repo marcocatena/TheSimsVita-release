@@ -32,16 +32,12 @@ All taken on a PS Vita, at its own 960 × 544.
 
 - **The whole game:** the base game plus Livin' Large, House Party, Hot Date, Vacation, Unleashed,
   Superstar and Makin' Magic, with their objects, Sims, careers and events.
-- **Live mode:** needs and moods, skills, jobs and the car pool, school, friendships and the social
-  interactions, free will, visitors, the maid and the other service Sims, burglars, fires, the
-  Grim Reaper, bills and the mail, pets, and the rest of what the game's own code does.
-- **Buy mode and build mode:** the full catalogues with their pictures; walls, fences, floors, wall
-  coverings, doors, windows, stairs, columns, pools, terrain and roofs.
-- **Going out:** cabs, car and balloon trips to Downtown, Vacation Island, Old Town, Studio Town and
-  Magic Town, and home again.
-- **Neighbourhoods and families:** every neighbourhood of the install, families moving in and out,
-  Create a Family.
-- **Sound and music:** the game's own sound engine and its music.
+- **An interface made for the Vita:** live, buy and build mode rebuilt around the touch screen and
+  the Vita's face buttons and sticks, not a PC mouse. Point with the left stick and press ✕, or just
+  tap; pie menus you can steer with the stick; catalogues in a side panel you page through with L / R;
+  pinch to zoom and twist to rotate; the right stick moves the view. A bar along the bottom always
+  shows what each button does right then. Remastered mode buttons, a battery saver setting, ~30 fps on
+  most lots.
 - **Saves:** every lot saved on the memory card, with autosave.
 - **Ad hoc Share:** send a lot, with its family, from one Vita to another nearby (no internet
   needed). Custom content used on the lot can go with it. From the internet button on a town's map.
@@ -49,8 +45,6 @@ All taken on a PS Vita, at its own 960 × 544.
   (Legacy Collection) and import the PC game's family files (`.FAM`) on the Vita.
 - **Custom content:** the install's own `Downloads` are read, and more can be added in
   `ux0:data/TheSimsVita/Downloads` (see [Files on the memory card](#files-on-the-memory-card)).
-- **Made for the Vita:** pad and touch controls, ~30 fps on most lots, a cleaner interface with
-  remastered mode buttons, a battery saver setting.
 - **Optional gameplay modifiers** (all off unless you choose them; see
   [Gameplay modifiers](#gameplay-modifiers)).
 
