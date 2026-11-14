@@ -1,0 +1,78 @@
+name: Bug report
+description: Something in the game doesn't work or doesn't look right
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! One problem per report, please. The more of the fields below you fill in,
+        the faster it can be found and fixed.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The app's version (Options › the build number at the bottom, or the VPK's name).
+      placeholder: "v0.2 (build 190)"
+    validations:
+      required: true
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where did it happen?
+      options:
+        - On a home lot (live mode)
+        - Buy mode
+        - Build mode
+        - Downtown (Hot Date)
+        - Vacation Island
+        - Old Town (Unleashed)
+        - Studio Town (Superstar)
+        - Magic Town (Makin' Magic)
+        - The neighbourhood map
+        - Create a Family
+        - Ad hoc Share or PC import/export
+        - Starting the app / installing
+        - Somewhere else
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to make it happen
+      description: The steps, as far as you know them (the family, the lot, what the Sims were doing).
+      placeholder: |
+        1. Took Lisa Downtown to the diner
+        2. Ordered the Gut Buster
+        3. ...
+  - type: dropdown
+    id: crash
+    attributes:
+      label: Did the app crash or freeze?
+      options:
+        - "No"
+        - It closed (an error message from the Vita)
+        - It froze
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: The log
+      description: |
+        Attach `ux0:data/TheSimsVita/log.txt` (drag the file into this box). If the app has been
+        started again since, the session it happened in is the latest file in `ux0:data/TheSimsVita/logs/`.
+  - type: textarea
+    id: extra
+    attributes:
+      label: Screenshots, saves, anything else
+      description: |
+        A screenshot (PS + START on the Vita) helps. For a problem on one lot, its save from
+        `ux0:data/TheSimsVita/saves/` (zipped) lets it be replayed. Also say if you use custom content
+        or any gameplay modifiers.
