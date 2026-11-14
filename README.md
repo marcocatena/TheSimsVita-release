@@ -65,14 +65,19 @@ Other editions of The Sims (the original discs, the Complete Collection) have no
 2. **Find your game's install folder** on the PC. In Steam: right-click The Sims Legacy Collection ›
    Manage › Browse local files. Usually
    `C:\Program Files (x86)\Steam\steamapps\common\The Sims Legacy Collection`.
-3. **Copy the game's files to the Vita**, to `ux0:data/TheSims/`. Connect the Vita with VitaShell:
-   press **SELECT** for USB mode and the memory card shows up as a drive on the PC (VitaShell's
-   settings can turn SELECT to FTP instead, for copying over Wi-Fi).
-   Copy these folders from the install folder into `ux0:data/TheSims/`, keeping their names, whichever
-   exist: `GameData`, `SoundData`, `Music`, `UIGraphics`, `ExpansionShared`, `ExpansionPack`,
-   `ExpansionPack2` … `ExpansionPack7`, `Deluxe`, `Downloads`, `UserData`, `UserData2` … `UserData8`.
+3. **Copy the game's files to the Vita.**
+   1. Connect the Vita: start VitaShell and press **SELECT**. The Vita's memory card shows up as a
+      drive on the PC (USB mode; VitaShell's settings can turn SELECT to FTP instead, for Wi-Fi).
+   2. On the memory card, make the folder `data/TheSims` (that's `ux0:data/TheSims/`; `ux0:data`
+      already exists).
+   3. Copy **every folder** from the install folder into it: `GameData`, `SoundData`, `ExpansionPack`
+      … `ExpansionPack7`, `UserData` … `UserData8`, the `Template…` folders and the rest, about 3 GB.
+      The files beside the folders (`Sims.exe`, the `.dll` files) aren't needed.
 
-   Check: the file `ux0:data/TheSims/GameData/UIText.iff` must exist.
+   Check: the file `ux0:data/TheSims/GameData/UIText.iff` must exist (not
+   `ux0:data/TheSims/The Sims Legacy Collection/GameData/UIText.iff`).
+
+   When the copy is done, close VitaShell's USB connection screen before starting the game.
 4. **Install the VPK:** copy it to the Vita (e.g. to `ux0:`), open it in VitaShell and press **✕**.
 5. **Start it** from its bubble. The **first start indexes the game's files and takes a few
    minutes**; later starts are quick.
