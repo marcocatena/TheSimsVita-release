@@ -39,16 +39,20 @@ constexpr WallTool kWallTools[] = { { 1, 0, 0 }, { 2, 248, 1 }, { 0xD, 250, 2 },
 constexpr uint16_t kFloorDiagonal = 255;
 
 // A STR# table of a file as triples or pairs, English.
-std::vector<std::string> strings_of(const uint8_t *data, const IffFile &iff, uint16_t id)
+// A string table's strings in the language shown (`english`: English's own; empty where it is
+// English that is shown, as nothing then differs).
+std::vector<std::string> strings_of(const uint8_t *data, const IffFile &iff, uint16_t id, bool english = false)
 {
     std::vector<std::string> out;
+    if (english && text_language() == 1)
+        return out;
     const IffChunk *c = iff.find("STR#", id);
     StringTable t;
     std::string err;
     if (!c || !parse_str(data + c->offset, c->size, t, err))
         return out;
     for (size_t i = 0;; i++) {
-        const std::string *s = t.get(i);
+        const std::string *s = english ? t.get_english(i) : t.get(i);
         if (!s)
             break;
         out.push_back(*s);
@@ -123,6 +127,7 @@ std::vector<BuildItem> build_mode_catalog(const Content &content)
         for (const auto &[table, kind] : { std::pair<uint16_t, BuildItem::Kind>{ 0x82, BuildItem::Floor },
                                            std::pair<uint16_t, BuildItem::Kind>{ 0x83, BuildItem::Wallpaper } }) {
             const auto s = strings_of(bytes.data(), iff, table);
+            const auto en = strings_of(bytes.data(), iff, table, true);
             for (size_t i = 0; i + 2 < s.size(); i += 3) {
                 BuildItem item;
                 item.kind = kind;
@@ -130,6 +135,10 @@ std::vector<BuildItem> build_mode_catalog(const Content &content)
                 item.price = std::atoi(s[i].c_str());
                 item.name = s[i + 1];
                 item.description = s[i + 2];
+                if (i + 2 < en.size()) {
+                    item.english_name = en[i + 1];
+                    item.english_description = en[i + 2];
+                }
                 out.push_back(item);
             }
         }
@@ -223,12 +232,17 @@ std::vector<BuildItem> build_mode_catalog(const Content &content)
         const auto s = strings_of(bytes.data(), iff, 0);
         if (s.size() < 2)
             continue;
+        const auto en = strings_of(bytes.data(), iff, 0, true);
         BuildItem item;
         item.kind = floor ? BuildItem::Floor : BuildItem::Wallpaper;
         item.file = name;
         item.name = s[0];
         item.price = std::atoi(s[1].c_str());
         item.description = s.size() > 2 ? s[2] : std::string();
+        if (en.size() >= 2) {
+            item.english_name = en[0];
+            item.english_description = en.size() > 2 ? en[2] : std::string();
+        }
         out.push_back(item);
     }
     // Doors, windows, stairs and the rest: objects with a build category.
@@ -374,9 +388,14 @@ int build_subgroup(const BuildItem &item)
     const std::vector<Subgroup> &groups = subgroups_of(item.kind, item.category);
     if (groups.empty())
         return -1;
-    int g = group_matching(groups, words_of(item.name));
+    // (By English words: another language shown, the English kept for it, or an object's label.)
+    const bool other = text_language() != 1;
+    const std::string &name = other && !item.english_name.empty() ? item.english_name : item.name;
+    int g = group_matching(groups, words_of(name));
+    if (g < 0 && other && item.info)
+        g = group_matching(groups, words_of(item.info->label));
     if (g < 0) {
-        std::string flavour = item.description;   // (not the tips every floor or covering shares)
+        std::string flavour = other && !item.english_name.empty() ? item.english_description : item.description;   // (not the tips every floor or covering shares)
         for (const char *tips : { "Decorating Tips", "Redecorating:", "Construction Tips", "Putting Up", "Building " })
             if (const size_t at = flavour.find(tips); at != std::string::npos)
                 flavour.resize(at);
@@ -415,6 +434,33 @@ void ensure_level(Lot &lot, int l)
 WallTile &wall_at(Lot &lot, int x, int y, int l)
 {
     return lot.walls[l][size_t(x) + size_t(y) * kLotArraySize];
+}
+
+// The ground under a tile: whether its four corners differ, and the height of its first.
+bool ground_sloped(const Lot &lot, int x, int y)
+{
+    const int n = kLotArraySize + 1;
+    if (lot.altitude.size() < size_t(n) * size_t(n) || x < 0 || y < 0 || x >= kLotArraySize || y >= kLotArraySize)
+        return false;
+    const uint8_t a = lot.altitude[size_t(x + y * n)];
+    return lot.altitude[size_t(x + 1 + y * n)] != a || lot.altitude[size_t(x + (y + 1) * n)] != a ||
+           lot.altitude[size_t(x + 1 + (y + 1) * n)] != a;
+}
+
+int ground_height(const Lot &lot, int x, int y)
+{
+    const int n = kLotArraySize + 1;
+    if (lot.altitude.size() < size_t(n) * size_t(n) || x < 0 || y < 0 || x >= kLotArraySize || y >= kLotArraySize)
+        return 0;
+    return lot.altitude[size_t(x + y * n)];
+}
+
+// What the exe pays back for architecture taken away: 80% of its price (walls cut down, sims.c 443717;
+// floors, coverings and pool tiles rounded, 303842, 533305, 447040). TS_NO_REFUNDS=1: nothing, as before.
+bool refunds_on()
+{
+    static const bool off = TS_ENV("TS_NO_REFUNDS") != nullptr;
+    return !off;
 }
 
 uint16_t &floor_at(Lot &lot, int x, int y, int l)
@@ -515,7 +561,151 @@ uint16_t Vm::style_for(const BuildItem &item)
     return uint16_t(kCustomStyle + styles.size() - 1);
 }
 
+// The terrain tools as the exe's (the 2026-11-20 build rules' audit; sims.c 471588-472909):
+//  - a corner's height is 0 to 64 ("Altitude is already as high / low as possible");
+//  - a corner can't change if any of the four tiles round it has a floor or a wall on either storey, is
+//    water or pool, isn't editable, or holds an object without the on-slope flag (placement 0x100: a hedge
+//    lets it through, a chair doesn't);
+//  - after a corner moves, each of its four neighbours more than 5 away is pulled to within 5, and so on
+//    outward, a simoleon a unit; if one of those can't change the stroke fails ("Tile cannot be modified");
+//  - the level tool is all or nothing, a simoleon a unit of height a corner, objects inside its rectangle
+//    going with the ground.
+// Ours had 0-255, no pull, a simoleon a corner whatever the height, any object holding its tile, and a
+// level that did what it could. TS_TERRAIN_OLD=1: as before (shape_terrain_old).
 int Vm::shape_terrain(int x0, int y0, int x1, int y1, int how, std::string &why)
+{
+    static const bool terrain_old = TS_ENV("TS_TERRAIN_OLD") != nullptr;
+    if (terrain_old)
+        return shape_terrain_old(x0, y0, x1, y1, how, why);
+    constexpr int V = kLotArraySize + 1;
+    constexpr int kTop = 64, kSteepest = 5;
+    if (lot.altitude.size() < size_t(V) * V)
+        lot.altitude.assign(size_t(V) * V, 0);
+    std::vector<uint8_t> work = lot.altitude;
+    auto at = [&](std::vector<uint8_t> &a, int cx, int cy) -> uint8_t & { return a[size_t(cx) + size_t(cy) * V]; };
+    const int target = how == 0 && x0 >= 0 && y0 >= 0 && x0 < V && y0 < V ? at(work, x0, y0) : 0;
+    if (x0 > x1)
+        std::swap(x0, x1);
+    if (y0 > y1)
+        std::swap(y0, y1);
+    // What holds a tile: architecture on either storey, water, the lot's uneditable part; and objects
+    // without the on-slope flag (the level tool lets those wholly inside its rectangle go with the ground).
+    std::vector<uint8_t> held(size_t(kLotArraySize) * kLotArraySize, 0), object_held = held;
+    for (int y = 0; y < lot.size; y++)
+        for (int x = 0; x < lot.size; x++) {
+            bool h = !lot.user_tile(x, y, move_objects) || (lot.ring_at(x, y) && !TS_ENV("TS_POOL_RING_OLD"));
+            for (int l = 0; l < kLotLevels && !h; l++)
+                h = (!lot.floors[l].empty() && floor_at(lot, x, y, l) != 0) || (!lot.walls[l].empty() && wall_at(lot, x, y, l).segments);
+            held[size_t(x) + size_t(y) * kLotArraySize] = h ? 1 : 0;
+        }
+    int moved_objects = 0;
+    for (auto &e : entities)
+        if (!e->dead && !e->person && e->in_world() && !e->container && e->level == 1 && e->tile_x() >= 0 && e->tile_y() >= 0 &&
+            e->tile_x() < kLotArraySize && e->tile_y() < kLotArraySize && !(e->value(VarPlacementFlags) & 0x100) &&
+            !(uint16_t(e->value(VarFlags)) & FlagHasZeroExtent)) {
+            const bool inside = how == 0 && e->tile_x() >= x0 && e->tile_x() < x1 && e->tile_y() >= y0 && e->tile_y() < y1;
+            if (inside)
+                moved_objects += e->group.empty() ? 0 : 1;   // (5 more for each tile of a many-tiled one: sims.c 472839)
+            else
+                object_held[size_t(e->tile_x()) + size_t(e->tile_y()) * kLotArraySize] = 1;
+        }
+    auto free_corner = [&](int cx, int cy) {
+        if (cx < 1 || cy < 1 || cx > lot.size - 1 || cy > lot.size - 1)
+            return false;
+        for (int ty = cy - 1; ty <= cy; ty++)
+            for (int tx = cx - 1; tx <= cx; tx++)
+                if (held[size_t(tx) + size_t(ty) * kLotArraySize] || object_held[size_t(tx) + size_t(ty) * kLotArraySize])
+                    return false;
+        return true;
+    };
+    // A corner set, and its neighbours pulled to within 5 of it, outward; the units moved, or -1 if a
+    // corner that has to follow can't.
+    auto set_corner = [&](std::vector<uint8_t> &a, int cx, int cy, int to) {
+        int units = std::abs(int(at(a, cx, cy)) - to);
+        at(a, cx, cy) = uint8_t(to);
+        std::vector<std::pair<int, int>> todo{ { cx, cy } };
+        static const int kSide[4][2] = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+        for (size_t i = 0; i < todo.size(); i++) {
+            const auto [px, py] = todo[i];
+            const int ph = at(a, px, py);
+            for (const auto &s : kSide) {
+                const int nx = px + s[0], ny = py + s[1];
+                if (nx < 1 || ny < 1 || nx > lot.size - 1 || ny > lot.size - 1)
+                    continue;   // (the lot's rim stays as it is)
+                const int d = int(at(a, nx, ny)) - ph;
+                if (d <= kSteepest && d >= -kSteepest)
+                    continue;
+                if (!free_corner(nx, ny))
+                    return -1;
+                const int to_n = d > 0 ? ph + kSteepest : ph - kSteepest;
+                units += std::abs(int(at(a, nx, ny)) - to_n);
+                at(a, nx, ny) = uint8_t(to_n);
+                todo.emplace_back(nx, ny);
+            }
+        }
+        return units;
+    };
+    int cost = 0, changed = 0;
+    bool blocked = false, at_limit = false, follow_failed = false;
+    if (how == 0) {   // level: all of the rectangle's corners, or none
+        for (int cy = std::max(y0, 0); cy <= std::min(y1, V - 1); cy++)
+            for (int cx = std::max(x0, 0); cx <= std::min(x1, V - 1); cx++) {
+                if (at(work, cx, cy) == target)
+                    continue;
+                if (!free_corner(cx, cy)) {
+                    why = "Tile cannot be modified";
+                    return 0;
+                }
+                const int units = set_corner(work, cx, cy, target);
+                if (units < 0) {
+                    why = "Tile cannot be modified";
+                    return 0;
+                }
+                cost += units;
+                changed++;
+            }
+        cost += 5 * moved_objects;
+    } else {
+        for (int cy = std::max(y0, 0); cy <= std::min(y1, V - 1); cy++)
+            for (int cx = std::max(x0, 0); cx <= std::min(x1, V - 1); cx++) {
+                const int h = at(work, cx, cy);
+                const int want = std::clamp(h + (how > 0 ? 1 : -1), 0, kTop);
+                if (want == h) {
+                    at_limit = true;
+                    continue;
+                }
+                if (!free_corner(cx, cy)) {
+                    blocked = true;
+                    continue;
+                }
+                std::vector<uint8_t> trial = work;
+                const int units = set_corner(trial, cx, cy, want);
+                if (units < 0) {
+                    follow_failed = true;
+                    continue;
+                }
+                work.swap(trial);
+                cost += units;
+                changed++;
+            }
+    }
+    if (!changed) {
+        why = follow_failed ? "Tile cannot be modified" : blocked ? "Something is in the way"
+              : at_limit ? (how > 0 ? "Altitude is already as high as possible" : "Altitude is already as low as possible") : "Nothing to change";
+        return 0;
+    }
+    if (cost > budget()) {
+        why = "Not enough money";
+        return -1;
+    }
+    lot.altitude.swap(work);
+    add_money(-cost);
+    book(kBookArchitecture, cost);
+    lot_edited();
+    return std::max(cost, 1);
+}
+
+int Vm::shape_terrain_old(int x0, int y0, int x1, int y1, int how, std::string &why)
 {
     constexpr int V = kLotArraySize + 1;
     if (lot.altitude.size() < size_t(V) * V)
@@ -676,7 +866,26 @@ int Vm::build_pool(int x0, int y0, int x1, int y1, int level, const BuildItem &i
                     why = "That's outside the area you can build on";
                     return 0;
                 }
-                if (wall_at(lot, x, y, l).segments) {
+                // The Water Tool doesn't go on a pool or its ring (the exe, sims.c 447990: error 0x13, STR# 137's
+                // "Must be placed on terrain"). TS_POOL_RING_OLD=1: as before.
+                if (item.pattern == kFloorWater && !TS_ENV("TS_POOL_RING_OLD") &&
+                    (floor_at(lot, x, y, l) == kFloorPool || lot.ring_at(x, y))) {
+                    why = "Must be placed on terrain";
+                    return 0;
+                }
+                // A wall on a pool tile is in the way only if it is diagonal, or stands between two pool
+                // tiles (existing ones or this rectangle's): a pool flush against the house is fine (the
+                // exe, sims.c 446563-446597). Ours refused any tile with a wall on any edge.
+                // TS_POOL_WALL_OLD=1: as before.
+                static const bool pool_wall_old = TS_ENV("TS_POOL_WALL_OLD") != nullptr;
+                const uint8_t segs = wall_at(lot, x, y, l).segments;
+                auto wet = [&](int tx, int ty) {
+                    return (tx >= x0 && tx <= x1 && ty >= y0 && ty <= y1) || floor_at(lot, tx, ty, l) == item.pattern;
+                };
+                const bool wall_between = (segs & (WallHorizontalDiag | WallVerticalDiag)) ||
+                                          ((segs & WallTopLeft) && wet(x - 1, y)) || ((segs & WallTopRight) && wet(x, y - 1)) ||
+                                          ((segs & WallBottomRight) && wet(x + 1, y)) || ((segs & WallBottomLeft) && wet(x, y + 1));
+                if (pool_wall_old ? segs != 0 : wall_between) {
                     why = "A wall is in the way";
                     return 0;
                 }
@@ -698,17 +907,114 @@ int Vm::build_pool(int x0, int y0, int x1, int y1, int level, const BuildItem &i
         why = "Nothing to change";
         return 0;
     }
-    const int cost = erase ? 0 : item.price * int(tiles.size());
+    // A pool with Sims in it keeps every tile (the exe, sims.c 446403: "Can't delete pool with Sims in it").
+    if (erase && item.pattern == kFloorPool && !TS_ENV("TS_POOL_SWIMMERS_OLD"))
+        for (const auto &up : entities) {
+            const Entity &e = *up;
+            if (e.dead || !e.person || !e.in_world() || e.level != level)
+                continue;
+            const uint16_t in_room = room_at(level, e.tile_x(), e.tile_y());
+            if (floor_at(lot, e.tile_x(), e.tile_y(), l) != kFloorPool)
+                continue;
+            for (auto [x, y] : tiles)
+                if (room_at(level, x, y) == in_room) {
+                    why = "Someone is swimming in that pool";
+                    return 0;
+                }
+        }
+    // Taken away: 80% of the Pool Tool's price a tile back; water tiles nothing (sims.c 447040, 448376).
+    const int cost = !erase ? item.price * int(tiles.size())
+                     : refunds_on() && item.pattern == kFloorPool ? -int(0.5 + double(tiles.size()) * architecture_price(3, 0) * 0.8) : 0;
     if (cost > budget()) {
         why = "Not enough money";
         return -1;
     }
-    for (auto [x, y] : tiles)
+    for (auto [x, y] : tiles) {
         floor_at(lot, x, y, l) = erase ? 0 : item.pattern;
+        if (!lot.pool_ring.empty() && !erase)
+            lot.pool_ring[size_t(x) + size_t(y) * kLotArraySize] = 0;
+    }
+    if (item.pattern == kFloorPool && !TS_ENV("TS_POOL_RING_OLD"))
+        make_pool_ring();
     add_money(-cost);
     book(kBookArchitecture, cost);
     lot_edited();
     return std::max(cost, 1);
+}
+
+// The exe's FUN_0063a6a0 (sims.c 446193), run after the Pool Tool: each pool tile's eight neighbours, the four
+// sides first ((0,-1), (0,1), (-1,0), (1,0), then (-1,-1), (1,1), (1,-1), (-1,1): DAT_00a51138), become ring
+// when they are none (not pool, not ring), editable, unfloored, flat (four corners alike), with no diagonal
+// wall, and no wall between them and the pool tile; a corner one only when both side tiles beside it (towards
+// the pool tile) are pool or ring. It only ever adds: an erased pool's ring stays, as the exe's.
+void Vm::make_pool_ring()
+{
+    constexpr int N = kLotArraySize, V = kLotArraySize + 1;
+    if (lot.floors[0].empty())
+        return;
+    if (lot.pool_ring.size() != size_t(N) * N)
+        lot.pool_ring.assign(size_t(N) * N, 0);
+    auto pool = [&](int x, int y) { return floor_at(lot, x, y, 0) == kFloorPool; };
+    auto ring = [&](int x, int y) -> uint8_t & { return lot.pool_ring[size_t(x) + size_t(y) * N]; };
+    auto flat = [&](int x, int y) {
+        if (lot.altitude.size() < size_t(V) * V)
+            return true;
+        const uint8_t a = lot.altitude[size_t(x + y * V)];
+        return lot.altitude[size_t(x + 1 + y * V)] == a && lot.altitude[size_t(x + (y + 1) * V)] == a &&
+               lot.altitude[size_t(x + 1 + (y + 1) * V)] == a;
+    };
+    // The tile's walls as the exe's FUN_00585a30 gathers them: its own top-left (1) and top-right (2) and
+    // diagonals (16, 32), the next tile's top-left as its bottom-right (4), the one below's top-right as its
+    // bottom-left (8).
+    auto walls = [&](int x, int y) {
+        int m = wall_at(lot, x, y, 0).segments & (WallTopLeft | WallTopRight | WallHorizontalDiag | WallVerticalDiag);
+        if (x + 1 < N && (wall_at(lot, x + 1, y, 0).segments & WallTopLeft))
+            m |= WallBottomRight;
+        if (y + 1 < N && (wall_at(lot, x, y + 1, 0).segments & WallTopRight))
+            m |= WallBottomLeft;
+        return m;
+    };
+    static const int kDir[8][2] = { { 0, -1 }, { 0, 1 }, { -1, 0 }, { 1, 0 }, { -1, -1 }, { 1, 1 }, { 1, -1 }, { -1, 1 } };
+    // The wall on the neighbour's side facing the pool tile (FUN_0063e020(FUN_0063e0e0(dir))).
+    static const int kFacing[4] = { WallBottomLeft, WallTopRight, WallBottomRight, WallTopLeft };
+    for (int y = 0; y < lot.size; y++)
+        for (int x = 0; x < lot.size; x++) {
+            if (!pool(x, y))
+                continue;
+            bool side[4] = { false, false, false, false };
+            for (int d = 0; d < 8; d++) {
+                const int nx = x + kDir[d][0], ny = y + kDir[d][1];
+                if (nx < 0 || ny < 0 || nx >= N || ny >= N)
+                    continue;
+                if (pool(nx, ny) || ring(nx, ny)) {
+                    if (d < 4)
+                        side[d] = true;
+                    continue;
+                }
+                const uint16_t f = floor_at(lot, nx, ny, 0);
+                if (!lot.user_tile(nx, ny, move_objects) || (f != 0 && f != kFloorWater) || !flat(nx, ny))
+                    continue;
+                const int m = walls(nx, ny);
+                if (m & (WallHorizontalDiag | WallVerticalDiag))
+                    continue;
+                bool mark;
+                if (d < 4)
+                    mark = !(m & kFacing[d]);
+                else if (d == 4)   // (-1,-1): the (0,-1) and (-1,0) sides
+                    mark = side[0] && side[2];
+                else if (d == 5)   // (1,1): (0,1) and (1,0)
+                    mark = side[1] && side[3];
+                else if (d == 6)   // (1,-1): (0,-1) and (1,0)
+                    mark = side[0] && side[3];
+                else               // (-1,1): (0,1) and (-1,0)
+                    mark = side[1] && side[2];
+                if (mark) {
+                    ring(nx, ny) = 1;
+                    if (d < 4)
+                        side[d] = true;
+                }
+            }
+        }
 }
 
 // The exe's floorable rule for an upper storey (FUN_005826b0's last pass over x, y = 1 .. size - 2):
@@ -781,6 +1087,7 @@ int Vm::build_floor(int x0, int y0, int x1, int y1, int level, const BuildItem *
     const uint16_t pattern = item ? style_for(*item) : 0;
     std::vector<std::pair<int, int>> tiles, split;
     int outside = 0;   // tiles of the rectangle off the editable area
+    int sloped_tiles = 0;   // and those on a slope, or under something that isn't for floors
     for (int y = y0; y <= y1; y++)
         for (int x = x0; x <= x1; x++) {
             const uint16_t f = floor_at(lot, x, y, l);
@@ -800,6 +1107,27 @@ int Vm::build_floor(int x0, int y0, int x1, int y1, int level, const BuildItem *
                     split.emplace_back(x, y);
                 continue;
             }
+            // On the ground the floor tool needs flat ground under the tile, and no object on it that isn't
+            // for floors (a tree, a flower: placement flag 1 missing): the exe, sims.c 303801 and 305073.
+            // TS_FLOOR_SLOPE_OLD=1: anywhere, as before.
+            static const bool floor_slope_old = TS_ENV("TS_FLOOR_SLOPE_OLD") != nullptr;
+            if (item && !floor_slope_old) {   // (the stairs' flight upstairs is such an object: no floor over it)
+                if (l == 0 && ground_sloped(lot, x, y)) {
+                    sloped_tiles++;
+                    continue;
+                }
+                bool blocked = false;
+                for (const auto &up : entities) {
+                    const Entity &e = *up;
+                    if (!e.dead && !e.person && e.in_world() && !e.container && e.level == level && e.tile_x() == x &&
+                        e.tile_y() == y && !(e.value(VarPlacementFlags) & 1) && !(uint16_t(e.value(VarFlags)) & FlagHasZeroExtent))
+                        blocked = true;
+                }
+                if (blocked) {
+                    sloped_tiles++;
+                    continue;
+                }
+            }
             if (item && l > 0) {   // upstairs: the exe's floorable tiles (a room or a column below, or beside floor)
                 static const bool old_rule = TS_ENV("TS_FLOORABLE_OLD") != nullptr;   // (a room below only)
                 if (old_rule) {
@@ -812,10 +1140,23 @@ int Vm::build_floor(int x0, int y0, int x1, int y1, int level, const BuildItem *
             tiles.emplace_back(x, y);
         }
     if (tiles.empty() && split.empty()) {
-        why = outside ? "That's outside the area you can build on" : item && l > 0 ? "Upstairs floors need walls below" : "Nothing to change";
+        why = outside ? "That's outside the area you can build on" : sloped_tiles ? "Floors need flat, clear ground"
+              : item && l > 0 ? "Upstairs floors need walls below" : "Nothing to change";
         return 0;
     }
-    const int cost = item ? item->price * int(tiles.size() + split.size()) : 0;
+    // A floor taken up pays 80% of its price back, a split tile's two halves half each (the exe, sims.c
+    // 303842); a new one over an old one costs its own price in full, nothing for the old.
+    int cost = item ? item->price * int(tiles.size() + split.size()) : 0;
+    if (!item && refunds_on()) {
+        double back = 0;
+        for (auto [x, y] : tiles)
+            back += architecture_price(0, floor_at(lot, x, y, l)) * 0.8;
+        for (auto [x, y] : split) {
+            const WallTile &w = wall_at(lot, x, y, l);
+            back += architecture_price(0, w.top_left_pattern) * 0.4 + architecture_price(0, w.top_left_style) * 0.4;
+        }
+        cost = -int(0.5 + back);
+    }
     if (cost > budget()) {
         why = "Not enough money";
         return -1;
@@ -914,6 +1255,7 @@ int Vm::build_walls(int x0, int y0, int x1, int y1, int level, const BuildItem &
     // them can't be sold. Ours refused the wall. TS_WALL_ERASE_OLD=1: refused, as before.
     static const bool erase_old = TS_ENV("TS_WALL_ERASE_OLD") != nullptr;
     std::vector<Entity *> hung;
+    int run_height = -1;   // the ground's height where a new wall's run began
     for (int i = std::max(a, 0); i < std::min(b, lot.size); i++) {
         const int x = vertical ? line : i, y = vertical ? i : line;
         const WallTile &w = wall_at(lot, x, y, l);
@@ -922,7 +1264,11 @@ int Vm::build_walls(int x0, int y0, int x1, int y1, int level, const BuildItem &
             continue;
         if (erase) {
             for (Entity *e : wall_users(*this, x, y, level, vertical)) {
-                if (erase_old || !movable_problem(e, true).empty()) {
+                // Only doors and windows (object type 8) go with their wall; anything else hung on it (a
+                // picture, a wall lamp) keeps the wall (the exe's 0xb, sims.c 443053-443140, 443281).
+                // TS_WALL_HUNG_OLD=1: all sold with it, as before.
+                const bool goes_with = e->info && e->info->objd.get(Objd::ObjectType) == 8;
+                if (erase_old || !movable_problem(e, true).empty() || (!goes_with && !TS_ENV("TS_WALL_HUNG_OLD"))) {
                     why = "Something is on that wall";
                     return -1;
                 }
@@ -941,6 +1287,28 @@ int Vm::build_walls(int x0, int y0, int x1, int y1, int level, const BuildItem &
             if (object_across(*this, x, y, level, vertical)) {
                 why = "Something is in the way";
                 return -1;
+            }
+            {
+                const int nx = vertical ? x - 1 : x, ny = vertical ? y : y - 1;
+                // No wall between two pool tiles (the exe's 0x1d "Can't place over water", sims.c 443288).
+                // TS_WALL_POOL_OLD=1: as before.
+                if (l == 0 && floor_at(lot, x, y, l) == kFloorPool && floor_at(lot, nx, ny, l) == kFloorPool &&
+                    !TS_ENV("TS_WALL_POOL_OLD")) {
+                    why = "Walls can't cross a pool";
+                    return -1;
+                }
+                // The wall tool (not the fences: styles 2, 12, 13, 14) needs the two tiles beside a segment
+                // flat and at the height where the run began (the exe's 0x11 "Can't place on slope", sims.c
+                // 443157). TS_WALL_SLOPE_OLD=1: anywhere, as before.
+                if (l == 0 && tool.pattern == 1 && !TS_ENV("TS_WALL_SLOPE_OLD")) {
+                    if (run_height < 0)
+                        run_height = ground_height(lot, x, y);
+                    if (ground_sloped(lot, x, y) || ground_sloped(lot, nx, ny) || ground_height(lot, x, y) != run_height ||
+                        ground_height(lot, nx, ny) != run_height) {
+                        why = "Walls need flat ground";
+                        return -1;
+                    }
+                }
             }
             if (l > 0) {
                 // Upstairs, as the exe's wall tool (FUN_006366b0): a tile either side of the edge floorable
@@ -969,14 +1337,27 @@ int Vm::build_walls(int x0, int y0, int x1, int y1, int level, const BuildItem &
         why = erase ? "No wall there" : "Already built";
         return 0;
     }
-    const int cost = erase ? 0 : tool.price * int(edges.size());
+    // A wall taken away pays 80% of its style's tool price back, cut down to whole Simoleons (the exe,
+    // sims.c 443717: wall 56, picket 8, privacy 28, balustrades 36).
+    int cost = erase ? 0 : tool.price * int(edges.size());
+    if (erase && refunds_on())
+        for (auto [x, y] : edges) {
+            const WallTile &w = wall_at(lot, x, y, l);
+            cost -= int(architecture_price(2, vertical ? w.top_left_style : w.top_right_style) * 0.8);
+        }
     if (cost > budget()) {
         why = "Not enough money";
         return -1;
     }
     for (Entity *e : hung) {   // (sold first: their own code sees the wall they hang on)
+        // (A door or window that goes with its wall brings 80% of its value: the exe, sims.c 445030.)
+        const int value = sell_value(e);
         std::string not_sold;
-        sell(e, not_sold);
+        if (sell(e, not_sold) && refunds_on()) {
+            const int kept = value - int(value * 0.8 + 0.5);
+            add_money(-kept);
+            book(kBookArchitecture, kept);
+        }
     }
     for (auto [x, y] : edges) {
         WallTile &w = wall_at(lot, x, y, l);
@@ -1290,7 +1671,7 @@ int Vm::fill_wallpaper(int x, int y, int level, int edge, const BuildItem &item,
     return spent > 0 ? spent : 0;
 }
 
-int Vm::build_wallpaper(int x, int y, int level, int edge, const BuildItem &item, std::string &why)
+int Vm::build_wallpaper(int x, int y, int level, int edge, const BuildItem &item, std::string &why, bool erase)
 {
     const int l = level - 1;
     if (l < 0 || l >= kLotLevels || lot.walls[l].empty() || x < 0 || y < 0 || x >= lot.size || y >= lot.size) {
@@ -1322,6 +1703,18 @@ int Vm::build_wallpaper(int x, int y, int level, int edge, const BuildItem &item
     if (!field || !solid_wall_style(style ? style : 1)) {
         why = "No wall there";
         return -1;
+    }
+    if (erase) {   // the face back to bare wall, 80% of the covering's price back (the exe, sims.c 533292-533309)
+        if (*field == 0) {
+            why = "Nothing to change";
+            return 0;
+        }
+        const int back = refunds_on() ? int(0.5 + architecture_price(1, *field) * 0.8) : 0;
+        *field = 0;
+        add_money(back);
+        book(kBookArchitecture, -back);
+        lot_edited();
+        return 1;
     }
     const uint16_t pattern = style_for(item);
     if (*field == pattern) {

@@ -28,8 +28,11 @@ struct RoofFace {
 };
 
 // The roof over `storey` (0 = over the ground floor). `rooms` holds the room
-// map of every storey.
-std::vector<RoofFace> build_roof(const Lot &lot, const RoomMap (&rooms)[kLotLevels], int storey);
+// map of every storey. `stairs_above`: the tiles (x + y * kLotArraySize, non-zero) where a staircase
+// (an object of build mode type 3) has a part on the storey above: no roof there (the exe, for the ground
+// storey's roof). Null: none.
+std::vector<RoofFace> build_roof(const Lot &lot, const RoomMap (&rooms)[kLotLevels], int storey,
+                                 const std::vector<uint8_t> *stairs_above = nullptr);
 
 // Whether the roof over `storey` covers tile (x, y): indoors there, nothing indoors or floored
 // on the storey above (as build_roof decides).

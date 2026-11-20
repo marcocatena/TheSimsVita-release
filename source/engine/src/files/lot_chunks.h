@@ -30,6 +30,9 @@ bool parse_arry(const uint8_t *data, size_t size, LotArray &out, std::string &er
 struct StyleEntry {
     std::string name;   // e.g. "FloorJadeTile.flr"
     uint8_t id = 0;
+    // The number's high byte (1 in the PC's files: a pattern of a file's is 0x100 and up in the
+    // two-byte grids, whose low byte the one-byte grids hold): for writing the grids (vm/fam_export.cpp).
+    uint8_t high = 0;
 };
 
 bool parse_style_map(const uint8_t *data, size_t size, uint16_t chunk_id, std::vector<StyleEntry> &out,
@@ -90,6 +93,7 @@ struct SlotItem {
     int32_t height = 0;
     int32_t facing = -2;          // -3 anywhere, -2 towards object, -1 away
     int32_t resolution = 16;
+    bool on_top_of = false;       // a script's "go on top of this object" (goto relative, location -2), not a SLOT entry
 };
 
 bool parse_slot(const uint8_t *data, size_t size, std::vector<SlotItem> &out, std::string &error);

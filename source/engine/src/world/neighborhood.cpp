@@ -485,17 +485,24 @@ bool load_neighborhood(Content &content, const std::string &user_data, Neighborh
             Family f;
             f.id = int16_t(c.id);
             r.i32();
-            r.i32();
+            const int fami_version = r.i32();
             r.skip(4);   // "IMAF"
             f.house = r.i32();
             f.number = r.i32();
             f.budget = r.i32();
             f.net_worth = r.i32();
             f.friends = r.i32();
-            r.i32();
+            f.flags = r.i32();
             const int members = r.i32();
             for (int i = 0; i < members && !r.bad; i++)
                 f.members.push_back(uint32_t(r.i32()));
+            // (The exe's reader, sims.c 291745-291848: version 8 adds the vacation lot, 9 the six shorts
+            // of what the family has made in Makin' Magic.)
+            if (!r.bad && fami_version >= 9 && r.at + 4 + 12 <= r.size) {
+                r.i32();   // the vacation lot: ours is the travel state
+                for (int16_t &s : f.spells)
+                    s = r.i16();
+            }
             if (!r.bad)
                 out.families.push_back(std::move(f));
         }
@@ -548,7 +555,10 @@ bool load_neighborhood(Content &content, const std::string &user_data, Neighborh
             StringTable t;
             if (parse_str(zbytes.data() + c->offset, c->size, t, zerr))
                 for (size_t i = 0;; i++) {
-                    const std::string *s = t.get(i);
+                    // (English (US)'s, whatever the language shown: the others' places hold other
+                    // things, and the community lots were residential in them: the lots run in
+                    // every language, 2026-11-16.)
+                    const std::string *s = t.get_english(i);
                     if (!s)
                         break;
                     const size_t comma = s->find(',');
@@ -580,6 +590,7 @@ bool load_neighborhood(Content &content, const std::string &user_data, Neighborh
             if (std::strcmp(c.type, "STR#") != 0 || c.id < 2000 || c.id > 2099 ||
                 !parse_str(dbytes.data() + c.offset, c.size, t, derr))
                 continue;
+            out.lot_texts_known.insert(c.id - 2000);
             if (const std::string *s = t.get(0); s && !s->empty())
                 out.lot_names[c.id - 2000] = *s;
             if (const std::string *s = t.get(1); s && s->find_first_not_of(" \t\r\n") != std::string::npos)
@@ -598,7 +609,7 @@ bool load_neighborhood(Content &content, const std::string &user_data, Neighborh
                 if (std::strcmp(c.type, "STR#") == 0 && (c.id == 2000 || c.id == 2001))
                     parse_str(sbytes.data() + c.offset, c.size, c.id == 2000 ? names : assigned, serr);
             for (size_t i = 0; i < 200; i++) {
-                const std::string *a = assigned.get(i);
+                const std::string *a = assigned.get_english(i);   // (a number: data, English (US)'s)
                 if (!a || a->empty())
                     continue;
                 const int street = std::atoi(a->c_str());

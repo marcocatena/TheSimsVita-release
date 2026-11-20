@@ -27,23 +27,35 @@ struct StringItem {
 struct StringTable {
     int16_t format = 0;
     std::vector<StringItem> items;   // every language, in file order
-    // English (US)'s places in items, made as it's read (parse_str): get() was a walk of the list,
-    // asked for every action's name every time free will looked at it.
+    // The shown language's places in items (text_language(): its index-th string where it has a
+    // non-empty one, else English (US)'s), made as it's read (parse_str): get() was a walk of the
+    // list, asked for every action's name every time free will looked at it.
     std::vector<uint32_t> english;
     bool indexed = false;
 
-    // The index-th string of a language, falling back to English (US).
+    // The index-th string in the shown language (text_language()), falling back to English (US);
+    // `language` other than 1: that language's, likewise.
     const std::string *get(size_t index, uint8_t language = 1) const;
+    // English (US)'s own index-th string, whatever the shown language (for the code's own checks).
+    const std::string *get_english(size_t index) const;
 };
+
+// The language the game's strings are shown in (the original's codes: 1 English (US), 2 English
+// (UK), 3 French ... 14 Portuguese; Res_Languages.h). Set once at start-up, before any file is
+// read: the string chunks are shrunk to it as files load (shrink_str_chunk).
+void set_text_language(uint8_t language);
+uint8_t text_language();
 
 bool parse_str(const uint8_t *data, size_t size, StringTable &out, std::string &error);
 // A string chunk type (STR#, CTSS, TTAs, FAMs: all in the STR# layout).
 bool is_string_chunk(const char *type);
-// The chunk with English (US) alone, in the -3 layout: the game's string chunks carry every
-// language (format -3 a language byte a string, -4 a set a language) and only English is read
-// (StringTable::get): half to nine tenths of a file's strings held for nothing, 8 MB of the
-// Vita's region at the Goths (2026-11-05). False when nothing can go (another format, or English
-// is all there is); the strings' order and indices within English are unchanged.
+// The chunk with one language alone, in the -3 layout: the game's string chunks carry every
+// language (format -3 a language byte a string, -4 a set a language) and only the shown one is
+// read (StringTable::get): half to nine tenths of a file's strings held for nothing, 8 MB of the
+// Vita's region at the Goths (2026-11-05). Kept: English (US)'s count of strings, each the shown
+// language's (text_language()) where it has a non-empty one, else English's, all marked English.
+// False when nothing can go (another format, or English is all there is); the strings' order
+// and indices within English are unchanged.
 bool shrink_str_chunk(const uint8_t *data, size_t size, std::vector<uint8_t> &out);
 
 // PALT: up to 256 RGB colours.
@@ -59,6 +71,9 @@ struct Image {
     int width = 0, height = 0;
     std::vector<uint32_t> rgba;    // 0xAABBGGRR
     std::vector<uint8_t> depth;    // empty if the frame has no z-buffer
+    // Decoded from a sprite's palette indices (SPR2, SPR#), not a picture made here (walls' faces, the ground,
+    // the interface): the atlas's count of what an indexed page could hold (2026-11-18, measuring).
+    bool from_palette = false;
     // Whether its pixels are here: a trim lets go of a cached picture's pixels and keeps the Image
     // (its address is what draw lists hold); one without draws nothing.
     bool has_pixels() const { return width > 0 && height > 0 && rgba.size() >= size_t(width) * size_t(height); }

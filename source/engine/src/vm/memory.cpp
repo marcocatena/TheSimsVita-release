@@ -73,12 +73,32 @@ int16_t neighbor_info(Frame &f, int data)
             if (e->person && !e->dead && e->person_data[31] == n->id)
                 return int16_t(e->id);
         return 0;
-    case 1:
+    case 1: {   // of the family in play (the exe's FUN_0054b9d0 case 1: the current family, on a trip the
+                // travellers', sims.c 67404, has this neighbour among its members). Ours gave the house's
+                // number, as 6: "can mail neighbor?" (MailboxVacation 4105) reads "1 == 0" as "not one of
+                // us", so no postcard could go to anyone with a house (the 2026-11-18 audit).
+                // TS_NEIGHBOR_IN_FAMILY_OLD=1: as before.
+        static const bool old = std::getenv("TS_NEIGHBOR_IN_FAMILY_OLD") != nullptr;
+        if (old)
+            return house_of();
+        const Family *mine = vm.family();
+        return mine && std::find(mine->members.begin(), mine->members.end(), n->guid) != mine->members.end() ? 1 : 0;
+    }
     case 6: return house_of();
     case 2: return n->person_data.size() > 58 ? n->person_data[58] : 0;   // age
     case 5:   // friends (mutual, in a family, not themselves: Neighborhood::neighbor_friends)
         return int16_t(vm.hood->neighbor_friends(*n, int(vm.global_tuning(2, "friendship threshold", 25.0f))));
-    case 7: return 1;   // has a telephone
+    case 7:   // the family's home lot has a phone; 8 a baby (the family record's flags: the exe's case 7 and 8,
+    case 8: { // sims.c 256436-256446; 0 for a family with no house). Ours: 7 always 1, 8 always 0 (the base game's
+              // audit, 2026-11-20: "Propose", "Move In", "Invite Home" refuse when 8 says a baby). TS_FAMILY_FLAGS_OLD=1.
+        if (TS_ENV("TS_FAMILY_FLAGS_OLD"))
+            return data == 7 ? 1 : 0;
+        for (const Family &fam : vm.hood->families)
+            for (uint32_t g : fam.members)
+                if (g == n->guid)
+                    return fam.house ? int16_t(data == 7 ? (fam.flags & 1) : ((fam.flags >> 1) & 1)) : int16_t(0);
+        return 0;
+    }
     case 9:   // the family's friends, worked out as the game keeps them (kept for the save)
         for (Family &fam : vm.hood->families)
             for (uint32_t g : fam.members)
@@ -87,6 +107,12 @@ int16_t neighbor_info(Frame &f, int data)
         return 0;
     default: return 0;
     }
+}
+
+bool exe_room_numbers()
+{
+    static const bool old = TS_ENV("TS_ROOM_NUMBERS_OLD") != nullptr;
+    return !old;
 }
 
 // An object variable as the game's code reads it. The room is where the object is now
@@ -102,7 +128,16 @@ int16_t object_value(const Vm &vm, const Entity &e, int16_t var)
         where = where->container;
     if (!where->in_world())
         return e.value(var);
-    return int16_t(vm.room_at(where->level, where->tile_x(), where->tile_y()));
+    const uint16_t room = vm.room_at(where->level, where->tile_x(), where->tile_y());
+    // The scripts' numbers are the exe's: each storey's rooms from (storey - 1) x 1024 counting from 0, the
+    // outdoors (the region at the lot's corner) 0, and an object off the lot -5 (FUN_005826b0, sims.c 298411-298521;
+    // FUN_0053d1a0). Ours count from 1 (0 "no room"), so every script's "room == 0" (outdoors: a pet's "Self
+    // Outside" and "Dig", "Force me outside", Makin' Magic's toadstool quest) never held, and the quest's loop
+    // ran on past the exe's whole limit (the open items' audit, 2026-11-20). The engine keeps its own; the
+    // scripts see the exe's, and give them back through RoomByTemp0. TS_ROOM_NUMBERS_OLD=1: ours, as before.
+    if (!exe_room_numbers())
+        return int16_t(room);
+    return room == 0 ? int16_t(-5) : int16_t(room - 1);
 }
 
 } // namespace
@@ -162,7 +197,7 @@ int16_t get(Frame &f, int scope, int16_t data)
     case StackObjectAttributeByParameter:
         return so && data >= 0 && size_t(data) < f.args.size() ? so->attribute(f.args[size_t(data)]) : 0;
     case RoomByTemp0: {   // the room numbered in temp 0
-        const int r = temp(f, 0);
+        const int r = temp(f, 0) + (exe_room_numbers() ? 1 : 0);   // (the scripts' number, the exe's: ours is one more)
         if (r <= 0 || size_t(r) >= vm.rooms.size())
             return 0;
         const Vm::Room &room = vm.rooms[size_t(r)];
@@ -199,7 +234,25 @@ int16_t get(Frame &f, int scope, int16_t data)
     }
     case MyTypeAttr: return vm.type_attribute(f.caller, data);
     case StackObjectTypeAttr: return vm.type_attribute(so, data);
-    case 38: return 0;   // unnamed in FreeSims; read by celebrity spawning
+    case 38: {
+        // The object definition of the neighbour whose id is in the stack object, numbered as the stack
+        // object's (two words of version, then the fields). Unnamed in FreeSims; Superstar's studio
+        // controller reads word 18 of each neighbour ("Spawn Super Celebs", ControllerStudioLot.iff 4124
+        // ip 2; "can visit?" 4114 ip 14), which is 1 in the seven real celebrities' definitions alone
+        // (Avril, Christina, Monroe, Freddie Prinze Jr, Jon Bon Jovi, Richie Sambora, Sarah McLachlan):
+        // answered 0, none of them ever came to a studio lot nor gave an autograph (the Superstar audit,
+        // 2026-11-18; inferred from the scripts' use, the exe's reader not read). TS_SCOPE38_OLD=1: 0.
+        static const bool old = TS_ENV("TS_SCOPE38_OLD") != nullptr;
+        const Neighbor *n = !old && vm.hood ? vm.hood->by_id(f.stack_id) : nullptr;
+        const ObjectInfo *info = n ? vm.content.object(n->guid) : nullptr;
+        if (!info || data < 0)
+            return 0;
+        if (data == 0)
+            return int16_t(info->objd.version & 0xffff);
+        if (data == 1)
+            return int16_t(info->objd.version >> 16);
+        return int16_t(info->objd.get(Objd::Field(data - 2)));
+    }
     case JobData:   // career in temp 0, level in temp 1
         return vm.hood ? int16_t(vm.hood->job_data(temp(f, 0), temp(f, 1), data)) : 0;
     case NeighborhoodData:
@@ -261,6 +314,9 @@ int16_t get(Frame &f, int scope, int16_t data)
     case StackObjectMasterDef: return definition(so, data);
     case FeatureEnableLevel: return 1;
     case MyAvatarID: return 0;
+    case StackObjectTemp:   // the stack object's temps (its thread's): three reads in npc-fx.iff (the Makin' Magic audit,
+               // 2026-11-18: "reading variable scope 13" on every Magic Town lot)
+        return so && so->thread && data >= 0 && size_t(data) < so->thread->temps.size() ? so->thread->temps[size_t(data)] : 0;
     default: break;
     }
     vm.warn(&f, "reading variable scope " + std::to_string(scope));
@@ -295,7 +351,11 @@ void set(Frame &f, int scope, int16_t data, int16_t value)
         if (data >= 0 && size_t(data) < f.args.size())
             f.args[size_t(data)] = value;
         return;
-    case StackObjectID: f.stack_id = value; return;
+    case StackObjectID:
+        f.stack_id = value;
+        if (f.thread)
+            f.thread->check_wrote_stack = true;   // (a menu's check naming entries by number: change_action_string)
+        return;
     case TempByTemp: temp_ref(f, temp(f, data), dummy) = value; return;
     case MyMotives:
         if (f.caller->person && data >= 0 && data < int(f.caller->motives.size()))
@@ -372,6 +432,10 @@ void set(Frame &f, int scope, int16_t data, int16_t value)
     }
     case MyLeadTileAttribute: f.caller->set_attribute(data, value); return;
     case StackObjectLeadTileAttribute: if (so) so->set_attribute(data, value); return;
+    case StackObjectTemp:   // the stack object's temps
+        if (so && so->thread && data >= 0 && size_t(data) < so->thread->temps.size())
+            so->thread->temps[size_t(data)] = value;
+        return;
     default: break;
     }
     vm.warn(&f, "writing variable scope " + std::to_string(scope));

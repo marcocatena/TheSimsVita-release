@@ -119,7 +119,8 @@ bool parse_style_map(const uint8_t *data, size_t size, uint16_t chunk_id, std::v
         e.name = padded_cstring(r);
         r.s32le();   // unknown, usually 1
         e.id = r.u8();
-        r.skip(5 + size_t(chunk_id) * 2);   // the trailing size depends on the chunk id
+        e.high = r.u8();
+        r.skip(4 + size_t(chunk_id) * 2);   // (id 1: a word more; then a kind and colour)
     }
     return check(r, error);
 }

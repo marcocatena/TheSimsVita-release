@@ -53,6 +53,10 @@ public:
     virtual bool playing(uint32_t handle) const = 0;
     virtual void stop(uint32_t handle) = 0;
     virtual void set_volume(uint32_t handle, float volume) = 0;
+    // What the note's track says of how it is heard (the .hot track line's fields): its sound level class
+    // (HIT variable 0x39: 0 never attenuated or panned, 10 loud, 20 normal, 10001 a stereo's) and its
+    // argument kind (2, kArgsIdVolPan: placed by its object; else full and centred).
+    virtual void note_class(uint32_t /*handle*/, int /*spl*/, int /*args*/) {}
 };
 
 // Volume groups (HITVolumeGroup): sound effects, music, voices, ambience.
@@ -72,8 +76,14 @@ public:
     // VMAvatar.SubmitHITVars), `loop` the primitive's loop flag. False if
     // the event is unknown or plays nothing.
     bool play(const std::string &event, uint16_t source, const int vars[29], bool loop);
+    // A track by its number, as the exe starts some by id with no event naming them (the beach lots' bed,
+    // BeachLoop 68259: FUN_006024a0). False if no table has it.
+    bool play_track(uint32_t track, uint16_t source, bool loop);
     // An object's sounds end (Stop All Sounds, the object gone).
     void stop(uint16_t source);
+    // The other objects sharing the voice of `source`'s playing tracks (the exe keeps one voice a track: a second
+    // object playing a track already sounding joins it, FUN_005fc6d0; placed by them all, FUN_005fdf20). Empty: none.
+    std::vector<uint16_t> sharers(uint16_t source) const;
     void stop_all();
     // Debug (the log's sound line): the sound threads running, and the program steps run since
     // the count was last reset (every tick of every thread adds its steps).

@@ -704,43 +704,33 @@ const Image *shadow_picture(Content &content, SpriteCache &sprites, int code, in
 // The shadow code an object casts, or -1 (the original's FUN_00596620 / FUN_00595a10 when it's
 // made): a single-tile object's OBJD Shadow; for a part of a multi-tile one, which of its
 // neighbouring parts (by SubIndex: low byte across, high byte down) cast one too.
-// The lot's placed objects by tile, for finding those near one without a pass over all of them
-// (every part of every multi-tile object did that: ~650 x 650 on a Downtown lot, each tick).
-using TileObjects = std::unordered_map<uint32_t, std::vector<const LotObject *>>;
-uint32_t tile_key(int level, int x, int y)
+// `parts`: the placed parts of its group (the same object file, definition and master id) on the lot, and
+// `kind_of` what each one's kind says (ObjectDrawCache::ShadowKind): the parts within three tiles on its storey
+// are the ones looked at. (Every part of every multi-tile object looked through all the lot's objects once:
+// ~650 x 650 on a Downtown lot, each tick; then through a map of the tiles' parts, 49 look-ups a part, and the
+// content's index for each neighbour.)
+template <class KindOf>
+int shadow_code(const LotObject &o, const ObjectDrawCache::ShadowKind &kind, const std::vector<const LotObject *> &parts,
+                KindOf &&kind_of)
 {
-    return uint32_t(level & 0xff) << 16 | uint32_t(x & 0xff) << 8 | uint32_t(y & 0xff);
-}
-
-int shadow_code(const LotObject &o, const ObjectInfo &info, const TileObjects &by_tile, Content &content)
-{
-    const int16_t own = int16_t(info.objd.get(Objd::Shadow));
+    const int16_t own = kind.shadow;
     if (own == -1)
         return -1;
-    const uint16_t master = info.objd.get(Objd::MasterID);
-    if (master == 0)
+    if (kind.group == 0)
         return own;
-    const int16_t sub = int16_t(info.objd.get(Objd::SubIndex));
+    const int16_t sub = kind.sub;
     const int lo = int8_t(sub & 0xff), hi = int8_t(sub >> 8);
     int code = 0;
     static const int kSide[8][3] = { { 0, -1, 0x01 }, { -1, 0, 0x02 }, { 0, 1, 0x04 }, { 1, 0, 0x08 },
                                      { -1, -1, 0x10 }, { -1, 1, 0x20 }, { 1, 1, 0x40 }, { 1, -1, 0x80 } };
-    std::vector<const LotObject *> near;
-    for (int dy = -3; dy <= 3; dy++)
-        for (int dx = -3; dx <= 3; dx++)
-            if (auto it = by_tile.find(tile_key(o.level, o.x + dx, o.y + dy)); it != by_tile.end() && o.x + dx >= 0 && o.y + dy >= 0)
-                near.insert(near.end(), it->second.begin(), it->second.end());
-    for (const LotObject *np : near) {
+    for (const LotObject *np : parts) {
         const LotObject &n = *np;
-        if (&n == &o)
+        if (&n == &o || n.level != o.level || n.x < 0 || n.y < 0 || std::abs(n.x - o.x) > 3 || std::abs(n.y - o.y) > 3)
             continue;
-        const ObjectInfo *ni = content.object(n.guid);
-        // (Master ids are numbered within each object file: the Goths' bed and stairs share 4.)
-        if (!ni || ni->objd.get(Objd::MasterID) != master || ni->ref.path != info.ref.path ||
-            ni->ref.offset != info.ref.offset || int16_t(ni->objd.get(Objd::Shadow)) == -1 ||
-            ni->objd.get(Objd::LevelOffset) != 0)
+        const ObjectDrawCache::ShadowKind nk = kind_of(n);
+        if (nk.shadow == -1 || nk.level_offset)
             continue;
-        const int16_t nsub = int16_t(ni->objd.get(Objd::SubIndex));
+        const int16_t nsub = nk.sub;
         if (nsub == -1)
             continue;
         const int nlo = int8_t(nsub & 0xff), nhi = int8_t(nsub >> 8);
@@ -979,9 +969,15 @@ LotScene build_lot_scene(const Lot &lot, Content &content, SpriteCache &sprites,
             for (int level = 0; level < kLotLevels; level++)
                 rooms[level] = build_rooms(lot, level);
             static const char *only = TS_ENV("TS_ROOF_STOREY");   // debug: one storey's roof alone
+            // The staircases' parts on the upper storey (build mode type 3): no roof under them.
+            std::vector<uint8_t> stairs(size_t(kLotArraySize) * kLotArraySize, 0);
+            for (const LotObject &o : lot.objects)
+                if (o.level == 1 && o.x >= 0 && o.y >= 0 && o.x < kLotArraySize && o.y < kLotArraySize)
+                    if (const ObjectInfo *info = content.object(o.guid); info && is_staircase(content, *info))
+                        stairs[size_t(o.x) + size_t(o.y) * kLotArraySize] = 1;
             for (int storey = 0; storey < kLotLevels; storey++)
                 if (!only || std::atoi(only) == storey)
-                    roofs[storey] = build_roof(lot, rooms, storey);
+                    roofs[storey] = build_roof(lot, rooms, storey, &stairs);
             // Nothing under the roof is hidden: the original draws the rooms and shows them through
             // the windows (the Goths' tub through the lower room's window, 2026-11-03). The holes
             // in roofs were the depth pass redrawing Sims and furniture by walls over the roof without
@@ -1040,9 +1036,19 @@ LotScene build_lot_scene(const Lot &lot, Content &content, SpriteCache &sprites,
     scene.width = int(max_x - min_x) + p.m.cadge_w;
     scene.height = int(max_y - min_y) + p.m.baseline + int(p.m.half_h) * 2;
     DrawList &out = scene.list;
-    scene.walls = std::make_shared<WallPainter>(lot, content, sprites, p, options.walls, top_level,
-                                                options.cut_follows ? &options.cut_rooms : nullptr);
-    scene.code = std::make_shared<ObjectCode>(content);
+    {
+        const auto t_painter = ts::FastClock::now();
+        scene.walls = std::make_shared<WallPainter>(lot, content, sprites, p, options.walls, top_level,
+                                                    options.cut_follows ? &options.cut_rooms : nullptr);
+        prof.painter_ms = ms_between(t_painter, ts::FastClock::now());
+    }
+    // The code scanner of the scene this one replaces, kept: what it found is each object type's own
+    // code read once (does it hide for the cutaway), the same whatever the camera. Made afresh with
+    // every scene, a turn or a cutaway move scanned every type's routines again: 17-27 ms of a turn's
+    // frame on the Vita (the Goths' lot, 96 objects, 2026-11-16). TS_CODE_FRESH=1: as before.
+    static const bool code_fresh = TS_ENV("TS_CODE_FRESH") != nullptr;
+    scene.code = !code_fresh && room && room->code && &room->code->content() == &content ? room->code
+                                                                                           : std::make_shared<ObjectCode>(content);
     static uint32_t generation = 0;
     scene.generation = ++generation;
     scene.zoom = zoom;
@@ -1439,7 +1445,23 @@ void compose_frame(const LotScene &scene, CharacterLibrary &library, const std::
 
 ComposeProfile g_compose_profile;
 double g_compose_time_left = -1;
+double g_compose_frame_ms = 30;
 bool g_pose_overlap = TS_ENV("TS_POSE_OVERLAP_OFF") == nullptr;
+#if defined(__vita__)
+int g_pose_async = 1;
+#else
+int g_pose_async = 0;
+#endif
+// At most 6 Sims posed a frame (the longest-waiting first; never-posed ones always). With 12 a busy lot ran in
+// two states: a slow frame lets more ticks pass, more Sims change, 12 are posed at 2.1 ms each and the frame
+// stays slow (the diner's far zoom 16-18 fps), while a fast one has fewer and stays fast (24). With 6 it held
+// 24.4-24.6 fps in every window of five, 12 dropping to 16-18 in four (the Vita, 2026-11-17, alternated 20 s
+// apart in one session). Each Sim then posed ~5.5 times a second at the diner, as the fast state already had.
+// TS_POSE_CAP=<n>: that many (12: as before).
+uint16_t g_pose_first = 0;
+int g_pose_cap = TS_ENV("TS_POSE_CAP") ? std::max(0, std::atoi(TS_ENV("TS_POSE_CAP"))) : 6;
+int g_pose_cap_far = 4;
+int g_pose_out_of_view_every = 30;
 
 namespace {
 
@@ -1487,6 +1509,16 @@ WorkPool &pose_pool()
             return std::clamp(std::atoi(n), 0, 7);
         return 2;
     }());
+    // The workers a step under the thread that starts them (the Vita; nothing elsewhere): at the same
+    // priority, with the game's thread filling a core at speed 3 on a busy lot, waking them put the main
+    // thread off its core for 1.2-1.6 ms a frame (the diner, 25 Sims: 26.7 fps, 27.7 with them a step
+    // under; no difference at speed 1; the main Vita, 2026-11-16). TS_POOL_PRIO=<n>: that many under (0: as before).
+    static const bool placed = [] {
+        const char *n = TS_ENV("TS_POOL_PRIO");
+        pool.set_priority_below(n ? std::clamp(std::atoi(n), 0, 32) : 1);
+        return true;
+    }();
+    (void)placed;
     return pool;
 }
 
@@ -1540,6 +1572,170 @@ static void sprite_windows(const LotObject &o, Content &content, Zoom zoom, int 
     }
 }
 
+namespace {
+
+// The poses of one compose: started on the pool, and taken (their meshes put in the Sims' places, what the log
+// says of them said) by the thread that composes, in that compose or at the start of the next (g_pose_async).
+// What a job reads: its Sim in the caller's list, the scene's projector, the characters' library (its own
+// lock), the Sim's entry's look-ups and its mesh shown; what it writes: its own mesh (`target`) and itself.
+struct PoseJob {
+    const LiveSim *sim;
+    uint64_t version;
+    ObjectDrawCache::SimEntry *kept;
+    DrawMesh *target = nullptr;   // the mesh shown itself (posed in place), or the spare, or the third
+    int slot = 0;                 // 0 in place, 1 the spare, 2 the third
+    uint32_t stamp_before = 0;
+    bool done = false, drawn = false;
+    std::string problem;
+    uint32_t serial = 0;   // its entry's own number (SimEntry::serial): taken only by that entry
+    // The Sim as it was posed, for the log (taken a compose later, the caller's list is another).
+    uint16_t id = 0;
+    float x = 0, y = 0, z = 0, light = 0;
+    int level = 0, lamp_count = 0;
+};
+struct PoseBatch {
+    std::vector<PoseJob> jobs;
+    std::function<void(int)> fn;
+    const LotScene *scene = nullptr;
+    SpriteCache *sprites = nullptr;
+    ObjectDrawCache *cache = nullptr;   // whose Sims they are
+    int frame = 0;       // the compose that started them
+    bool live = false;   // started, not taken yet
+};
+PoseBatch &poses()
+{
+    static PoseBatch batch;
+    return batch;
+}
+std::atomic<bool> g_poses_live{ false };   // (poses().live, readable when the batch itself may be gone)
+
+void pose_one(int i)
+{
+    PoseBatch &batch = poses();
+    PoseJob &job = batch.jobs[size_t(i)];
+    const LiveSim &s = *job.sim;
+    g_compose_item = s.id;
+    SimPose pose{ s.animation, s.time_ms, s.weight, { s.layers[0], s.layers[1] } };
+    pose.hold_end = s.hold_end;
+    pose.carry = s.carry;
+    pose.head_yaw = s.head_yaw;
+    pose.light = s.light;
+    pose.lamp_count = s.lamp_count;
+    std::copy(std::begin(s.lamps), std::end(s.lamps), std::begin(pose.lamps));
+    ObjectDrawCache::SimEntry &kept = *job.kept;
+    // Made in the Sim's other mesh (or its third), which then takes the first one's place: a frame being drawn
+    // points at the first. What a pose leaves as it was (the bounds of one that drew nothing, the anchor) and
+    // the count of poses go over first, so the outcome is the same as posing in place; a pose that fails
+    // before writing anything leaves the Sim's mesh the one in use.
+    DrawMesh *target = job.target;
+    if (target != kept.mesh.get()) {
+        const DrawMesh &from = *kept.mesh;
+        DrawMesh &to = *target;
+        to.x0 = from.x0, to.y0 = from.y0, to.x1 = from.x1, to.y1 = from.y1;
+        to.pose_stamp = from.pose_stamp;
+        to.depth_sum = from.depth_sum, to.depth_count = from.depth_count, to.depth_for = from.depth_for;
+        to.has_anchor = from.has_anchor, to.ax = from.ax, to.ay = from.ay, to.az = from.az;
+        for (int k = 0; k < 7; k++) {
+            to.part_x[k] = from.part_x[k], to.part_y[k] = from.part_y[k], to.part_d[k] = from.part_d[k];
+            to.part_lx[k] = from.part_lx[k], to.part_ly[k] = from.part_ly[k], to.part_lz[k] = from.part_lz[k];
+        }
+        to.parts_found = from.parts_found;
+        to.tile_w = from.tile_w;
+    }
+    job.stamp_before = target->pose_stamp;
+    job.drawn = draw_sim_mesh(*target, batch.scene->projector, batch.sprites->characters(), s.look, s.x, s.y, s.z, s.direction, pose,
+                              job.problem, s.colour, &kept.lookups);
+    job.done = true;
+}
+
+// The batch's poses taken: each done one's mesh in its Sim's place, the Sim's entry brought up to it. The
+// pool is not busy (finished) when this is called.
+void take_poses()
+{
+    PoseBatch &batch = poses();
+    if (!batch.live)
+        return;
+    batch.live = false;
+    g_poses_live = false;
+    for (PoseJob &job : batch.jobs) {
+        if (!job.done)
+            continue;   // (not begun: the frame ran out of time; it keeps the pose it has)
+        // Its entry still the one it was made for? (Let go since: the pose with it. Nothing of the job's is
+        // touched then: its mesh went with the entry.)
+        const auto found = batch.cache ? batch.cache->sims.find(job.id) : std::map<uint16_t, ObjectDrawCache::SimEntry>::iterator();
+        if (!batch.cache || found == batch.cache->sims.end() || &found->second != job.kept || found->second.serial != job.serial) {
+            g_compose_profile.poses_lost++;
+            static int said = 0;
+            if (said < 5) {
+                said++;
+                std::printf("pose of Sim %d not taken: its entry was let go since it was started\n", int(job.id));
+            }
+            continue;
+        }
+        ObjectDrawCache::SimEntry &kept = *job.kept;
+        const PoseJob &s = job;   // (the Sim as posed: its place in the list may hold another now)
+        if (job.slot != 0 && job.target->pose_stamp != job.stamp_before) {
+            // (The mesh that was shown goes where the new one came from: last shown in the compose before this.)
+            std::swap(kept.mesh, job.slot == 2 ? kept.third : kept.spare);
+            (job.slot == 2 ? kept.third_shown : kept.spare_shown) = g_compose_profile.frames - 1;
+        }
+        const bool drawn = job.drawn;
+        const std::string &problem = job.problem;
+        if (!drawn && TS_ENV("TS_SIM_PROBLEM"))   // debug: why a Sim isn't drawn
+            std::printf("can't draw Sim %d: %s\n", int(s.id), problem.c_str());
+        // Said in the log: a pose that drew nothing, or left a part out (the first, then every 150th of a Sim's
+        // run of them), and the Sim drawn again after it (the user saw Lisa invisible at the diner for a while,
+        // 2026-11-17, with no log left to say why).
+        if (!drawn || kept.mesh->tris.empty() || !problem.empty()) {
+            if (kept.undrawn++ % 150 == 0)
+                std::printf("Sim %d at %.1f,%.1f: %s (%d triangles; %d poses so)%s%s\n", int(s.id), s.x, s.y,
+                            !drawn || kept.mesh->tris.empty() ? "not drawn" : "drawn in part", int(kept.mesh->tris.size()),
+                            kept.undrawn, problem.empty() ? "" : ": ", problem.substr(0, 160).c_str());
+        } else if (kept.undrawn) {
+            std::printf("Sim %d drawn again after %d poses not drawn or in part\n", int(s.id), kept.undrawn);
+            kept.undrawn = 0;
+        }
+        if (TS_ENV("TS_SIM_PROBLEM")) {   // debug: what was made of it
+            const DrawMesh &dm = *kept.mesh;
+            uint32_t a0 = dm.tris.empty() ? 0 : dm.tris[0].tint[0];
+            size_t untextured = 0;
+            for (const MeshTri &t : dm.tris)
+                untextured += t.texture == nullptr || !t.texture->width;
+            std::printf("Sim %d: %zu of its triangles without a texture; at lot (%.2f, %.2f, %.2f) level %d\n", int(s.id),
+                        untextured, s.x, s.y, s.z, s.level);
+            std::printf("Sim %d: %zu triangles, bounds %.0f,%.0f - %.0f,%.0f, first tint %08x, light %.2f lamps %d\n", int(s.id),
+                        dm.tris.size(), dm.x0, dm.y0, dm.x1, dm.y1, a0, s.light, s.lamp_count);
+        }
+        kept.version = job.version;
+        kept.posed = true;
+        kept.posed_frame = batch.frame;
+    }
+    batch.jobs.clear();
+}
+
+} // namespace
+
+void finish_poses()
+{
+    if (!g_poses_live.load() || !pose_pool().busy())
+        return;
+    const auto t = FastClock::now();
+    pose_pool().finish();
+    g_compose_profile.poses_settled_ms += std::chrono::duration<double, std::milli>(FastClock::now() - t).count();
+}
+
+void drop_poses()
+{
+    if (!g_poses_live.load())
+        return;
+    pose_pool().finish();
+    PoseBatch &batch = poses();
+    batch.live = false;
+    g_poses_live = false;
+    batch.jobs.clear();
+    batch.cache = nullptr;
+}
+
 void compose_frame(const LotScene &scene, const Lot &lot, const std::vector<LotObject> &objects, Content &content,
                    SpriteCache &sprites, ObjectDrawCache &cache, const std::vector<LiveSim> &sims, DrawList &out,
                    std::vector<FrameItem> *items, std::vector<DrawBounds> *out_bounds, const DrawBounds *view)
@@ -1551,6 +1747,14 @@ void compose_frame(const LotScene &scene, const Lot &lot, const std::vector<LotO
     const auto t_objects = PClock::now();
     double sims_ms = 0;
     g_compose_profile.frames++;
+    if (poses().live) {   // the poses the compose before started (g_pose_async): theirs now, before anything else
+        const auto t_taken = PClock::now();
+        pose_pool().finish();
+        take_poses();
+        const double ms = since(t_taken);
+        sims_ms += ms;
+        g_compose_profile.poses_taken_ms += ms;
+    }
     // The frame's deadline (g_compose_time_left): how much of it is left now; no limit under 0.
     const double left_at_start = g_compose_time_left;
     auto time_left = [&] { return left_at_start < 0 ? 1e9 : left_at_start - since(t_objects); };
@@ -1563,7 +1767,17 @@ void compose_frame(const LotScene &scene, const Lot &lot, const std::vector<LotO
         // the card each time the cutaway followed the cursor.)
         if (scene.look_generation == 0 || scene.look_generation != cache.look_generation) {
             cache.entries.clear();
+            if (cache.double_buffer)   // (the frame being drawn may point at them)
+                for (auto &entry : cache.sims) {
+                    if (entry.second.mesh)
+                        cache.retired.push_back(std::move(entry.second.mesh));
+                    if (entry.second.spare)
+                        cache.retired.push_back(std::move(entry.second.spare));
+                    if (entry.second.third)
+                        cache.retired.push_back(std::move(entry.second.third));
+                }
             cache.sims.clear();
+            cache.fresh_view = 12;
             g_compose_profile.scenes_new++;
         } else {
             g_compose_profile.scenes_kept++;
@@ -1583,11 +1797,12 @@ void compose_frame(const LotScene &scene, const Lot &lot, const std::vector<LotO
         const std::vector<DrawCmd> *cmds;
         const LiveSim *sim;
         const std::vector<DrawBounds> *bounds = nullptr;
+        DrawBounds box{};   // (an object's: its draws' bounds as one)
+        bool boxed = false;
     };
     std::vector<Insert> inserts;
     constexpr int kShadowOrder = std::numeric_limits<int>::min();
     // The Sims in view, posed (those whose pose changed): each on its own thread of the pool.
-    std::function<void(int)> pose_job;
     std::vector<const LiveSim *> shown;
     for (const LiveSim &s : sims) {
         if (view) {   // far off the screen (a Sim stands well under 400 pixels tall at any zoom)
@@ -1599,10 +1814,19 @@ void compose_frame(const LotScene &scene, const Lot &lot, const std::vector<LotO
         }
         shown.push_back(&s);
     }
-    struct PoseJob {
-        const LiveSim *sim;
-        uint64_t version;
-        ObjectDrawCache::SimEntry *kept;
+    // Out of the view (g_pose_out_of_view_every): neither where its last pose drew it, with a tile to the sides
+    // and below and two above for what floats over the head (the plumbob, a balloon: they go by the mesh), nor
+    // where it stands now, by a margin of its own size and a tile.
+    auto out_of_view = [&](const LiveSim &s, const DrawMesh &m) {
+        const float tile = 2.0f * float(scene.projector.m.half_w);
+        if (!m.tris.empty() && m.x1 + tile > view->x0 && m.x0 - tile < view->x1 && m.y1 + tile > view->y0 &&
+            m.y0 - 2 * tile < view->y1)
+            return false;
+        float fx, fy;
+        scene.projector.screen(s.x, s.y, s.z, fx, fy);
+        const float size = m.tris.empty() ? 200.0f : std::max(m.x1 - m.x0, m.y1 - m.y0);
+        const float margin = std::clamp(1.2f * size + tile, 96.0f, 400.0f);
+        return fx < view->x0 - margin || fx > view->x1 + margin || fy < view->y0 - margin || fy > view->y1 + margin;
     };
     std::vector<PoseJob> pose_jobs;
     for (const LiveSim *sp : shown) {
@@ -1610,8 +1834,33 @@ void compose_frame(const LotScene &scene, const Lot &lot, const std::vector<LotO
         const uint64_t v = sim_version(s);
         ObjectDrawCache::SimEntry &kept = cache.sims[s.id];
         kept.used = true;
-        if (kept.version != v || !kept.posed)
-            pose_jobs.push_back({ &s, v, &kept });
+        // Said in the log (40 times a run at most): a Sim more than three tiles from where the last frame had it,
+        // on the same storey: set down somewhere else, not walked there.
+        if (kept.seen_frame == g_compose_profile.frames - 1 && kept.last_level == s.level) {
+            const float dx = s.x - kept.last_x, dy = s.y - kept.last_y;
+            static int said = 0;
+            if (dx * dx + dy * dy > 9.0f && said < 40) {
+                said++;
+                std::printf("Sim %d moved %.1f tiles in one frame: %.1f,%.1f to %.1f,%.1f (storey %d)\n", int(s.id),
+                            std::sqrt(dx * dx + dy * dy), kept.last_x, kept.last_y, s.x, s.y, s.level + 1);
+            }
+        }
+        kept.last_x = s.x, kept.last_y = s.y, kept.last_level = s.level;
+        kept.seen_frame = g_compose_profile.frames;
+        if (kept.version != v || !kept.posed) {
+            if (kept.posed && view && g_pose_out_of_view_every > 0 &&
+                g_compose_profile.frames - kept.posed_frame < g_pose_out_of_view_every && out_of_view(s, *kept.mesh)) {
+                g_compose_profile.sims_out_of_view++;   // (it keeps the pose it has: nobody sees it)
+                continue;
+            }
+            PoseJob job;
+            job.sim = &s;
+            job.version = v;
+            job.kept = &kept;
+            job.serial = kept.serial;
+            job.id = s.id, job.x = s.x, job.y = s.y, job.z = s.z, job.level = s.level, job.light = s.light, job.lamp_count = s.lamp_count;
+            pose_jobs.push_back(std::move(job));
+        }
     }
     // Late: only the Sims never posed, and half of the rest, the longest since their last pose
     // first (the others keep the pose they had: a tick behind, for one frame). Posing is ~0.5 ms
@@ -1622,12 +1871,48 @@ void compose_frame(const LotScene &scene, const Lot &lot, const std::vector<LotO
     // In order of need (never posed first, then the longest since their last pose): the poses
     // are taken in this order, and when the frame runs short (finish, below) the ones left
     // undone are the least urgent.
-    constexpr size_t cap = 12;
+    const bool far_cap = scene.zoom == Zoom::Far && left_at_start >= 0 && g_pose_cap_far > 0;
+    const size_t cap = size_t(std::max(far_cap ? std::min(g_pose_cap, g_pose_cap_far) : g_pose_cap, 1));
+    // The player's own Sim and the two nearest them (within three tiles, on their storey: who they talk to, dance
+    // with) first, every frame: at the diner each Sim's turn came every second or third frame, the player's
+    // own among them, and a handshake's other half stood out (the user, 2026-11-17).
+    {
+        static const bool first_off = TS_ENV("TS_POSE_FIRST_OFF") != nullptr;
+        const LiveSim *own = nullptr;
+        for (const LiveSim *sp : shown)
+            if (!first_off && g_pose_first && sp->id == g_pose_first)
+                own = sp;
+        const PoseJob *near[2] = { nullptr, nullptr };
+        float near_d[2] = { 9.0f, 9.0f };   // (squared: three tiles)
+        for (PoseJob &job : pose_jobs) {
+            job.kept->first = own && job.sim == own;
+            if (!own || job.sim == own || job.sim->level != own->level)
+                continue;
+            const float dx = job.sim->x - own->x, dy = job.sim->y - own->y, d = dx * dx + dy * dy;
+            if (d < near_d[0]) {
+                near[1] = near[0], near_d[1] = near_d[0];
+                near[0] = &job, near_d[0] = d;
+            } else if (d < near_d[1]) {
+                near[1] = &job, near_d[1] = d;
+            }
+        }
+        for (const PoseJob *job : near)
+            if (job)
+                job->kept->first = true;
+    }
     std::stable_sort(pose_jobs.begin(), pose_jobs.end(), [](const PoseJob &a, const PoseJob &b) {
         if (a.kept->posed != b.kept->posed)
             return !a.kept->posed;
+        if (a.kept->first != b.kept->first)
+            return a.kept->first;
         return a.kept->posed_frame < b.kept->posed_frame;
     });
+    if (g_pose_cap == 0) {   // (debug: only the Sims never posed; the rest keep the pose they have)
+        size_t first = 0;
+        while (first < pose_jobs.size() && !pose_jobs[first].kept->posed)
+            first++;
+        pose_jobs.resize(first);
+    }
     if (pose_jobs.size() > 2 && (pose_jobs.size() > cap || time_left() < 6.0 + 0.5 * double(pose_jobs.size()))) {
         size_t keep = (pose_jobs.size() + 1) / 2;
         if (pose_jobs.size() > cap)
@@ -1644,44 +1929,74 @@ void compose_frame(const LotScene &scene, const Lot &lot, const std::vector<LotO
     // restaurant on the Vita (2026-11-07).
     g_compose_step = "posing the Sims";
     g_compose_item = int(pose_jobs.size());
-    pose_job = [&](int i) {
-        const PoseJob &job = pose_jobs[size_t(i)];
-        const LiveSim &s = *job.sim;
-        g_compose_item = s.id;
-        SimPose pose{ s.animation, s.time_ms, s.weight, { s.layers[0], s.layers[1] } };
-        pose.hold_end = s.hold_end;
-        pose.carry = s.carry;
-        pose.head_yaw = s.head_yaw;
-        pose.light = s.light;
-        pose.lamp_count = s.lamp_count;
-        std::copy(std::begin(s.lamps), std::end(s.lamps), std::begin(pose.lamps));
-        std::string problem;
+    // Not waited for (g_pose_async): where every Sim to pose has a pose already (one never posed, a Sim come
+    // into view, is waited for as before: it would be missing for a frame), the poses overlap the objects'
+    // compose, and the frame has a deadline (or everywhere, for trying).
+    bool behind = g_pose_overlap && !pose_jobs.empty() && (g_pose_async == 2 || (g_pose_async == 1 && left_at_start >= 0));
+    for (const PoseJob &job : pose_jobs)
+        behind = behind && job.kept->posed;
+    // Each pose's mesh. In place where no frame can be on its way from the Sim's mesh and the pose is waited
+    // for (as ever); else one of its other two that the frame before this compose was not drawn from: that
+    // frame may be being drawn now (double_buffer), and a pose not waited for is still being made while this
+    // one is.
+    for (PoseJob &job : pose_jobs) {
         ObjectDrawCache::SimEntry &kept = *job.kept;
-        if (!draw_sim_mesh(*kept.mesh, scene.projector, sprites.characters(), s.look, s.x, s.y, s.z, s.direction, pose, problem,
-                           s.colour, &kept.lookups) &&
-            TS_ENV("TS_SIM_PROBLEM"))   // debug: why a Sim isn't drawn
-            std::printf("can't draw Sim %d: %s\n", int(s.id), problem.c_str());
-        if (TS_ENV("TS_SIM_PROBLEM")) {   // debug: what was made of it
-            const DrawMesh &dm = *kept.mesh;
-            uint32_t a0 = dm.tris.empty() ? 0 : dm.tris[0].tint[0];
-            size_t untextured = 0;
-            for (const MeshTri &t : dm.tris)
-                untextured += t.texture == nullptr || !t.texture->width;
-            std::printf("Sim %d: %zu of its triangles without a texture; at lot (%.2f, %.2f, %.2f) level %d\n", int(s.id),
-                        untextured, s.x, s.y, s.z, s.level);
-            std::printf("Sim %d: %zu triangles, bounds %.0f,%.0f - %.0f,%.0f, first tint %08x, light %.2f lamps %d\n", int(s.id),
-                        dm.tris.size(), dm.x0, dm.y0, dm.x1, dm.y1, a0, s.light, s.lamp_count);
+        if (!cache.double_buffer && !behind) {
+            job.target = kept.mesh.get();
+            job.slot = 0;
+            continue;
         }
-        kept.version = job.version;
-        kept.posed = true;
-        kept.posed_frame = g_compose_profile.frames;
-    };
-    pose_pool().start(int(pose_jobs.size()), pose_job);
-    // Finished whatever leaves this function: a bad_alloc out of the objects' compose (the Vita drops
-    // the frame) left the pool's workers on pose_job, a local gone, and its jobs' meshes.
+        const int last = g_compose_profile.frames - 1;
+        if (!kept.spare || !cache.double_buffer || kept.spare_shown < last) {
+            if (!kept.spare)
+                kept.spare = std::make_unique<DrawMesh>();
+            job.target = kept.spare.get();
+            job.slot = 1;
+        } else {
+            if (kept.third && kept.third_shown >= last) {   // (both shown lately: cannot be, but never a mesh in use)
+                cache.retired.push_back(std::move(kept.third));
+                kept.third_shown = -9;
+            }
+            if (!kept.third) {
+                kept.third = std::make_unique<DrawMesh>();
+                g_compose_profile.thirds_made++;
+            }
+            job.target = kept.third.get();
+            job.slot = 2;
+        }
+    }
+    {
+        PoseBatch &batch = poses();
+        batch.jobs = std::move(pose_jobs);
+        batch.scene = &scene;
+        batch.sprites = &sprites;
+        batch.cache = &cache;
+        batch.frame = g_compose_profile.frames;
+        if (!batch.fn)
+            batch.fn = pose_one;
+        batch.live = !batch.jobs.empty();
+        g_poses_live = batch.live;
+        if (behind)
+            g_compose_profile.poses_behind += int(batch.jobs.size());
+    }
+    g_compose_profile.setup_ms += since(t_objects);
+    {
+        const auto t_start = PClock::now();
+        pose_pool().start(int(poses().jobs.size()), poses().fn);
+        g_compose_profile.pool_start_ms += since(t_start);
+    }
+    const auto t_resets = PClock::now();
+    // Finished whatever leaves this function, where they are waited for: a bad_alloc out of the objects'
+    // compose (the Vita drops the frame) left the pool's workers at their poses. (What they made is taken by
+    // the next compose. Not waited for, they go on: the batch is not this function's.)
     struct PosesFinished {
-        ~PosesFinished() { pose_pool().finish([] { return true; }); }   // (what's not begun stays undone)
-    } poses_finished;
+        bool waited;
+        ~PosesFinished()
+        {
+            if (waited)
+                pose_pool().finish([] { return true; });   // (what's not begun stays undone)
+        }
+    } poses_finished{ !behind };
     if (!g_pose_overlap) {   // (the remote's "overlap 0": the poses done here, before the objects, as an A/B)
         const auto t_sim = PClock::now();
         const int undone = pose_pool().finish([&] { return time_left() < 2.0; });
@@ -1691,14 +2006,25 @@ void compose_frame(const LotScene &scene, const Lot &lot, const std::vector<LotO
         }
         sims_ms += since(t_sim);
     }
+    // The view moved (or is another): the objects left far off the screen in the last one are looked at again.
+    bool view_moved = false;
+    if (view && (!cache.view_known || view->x0 != cache.view_seen.x0 || view->y0 != cache.view_seen.y0 ||
+                 view->x1 != cache.view_seen.x1 || view->y1 != cache.view_seen.y1)) {
+        cache.view_seen = *view;
+        cache.view_known = true;
+        if (++cache.view_stamp == 0)
+            cache.view_stamp = 1;
+        view_moved = true;
+    }
     const bool same_objects = cache.objects_version != 0 && cache.objects_version == cache.placed_version &&
-                              !cache.pending_left;
+                              !cache.pending_left && !(view_moved && cache.parked > 0);
     if (!same_objects) {
     cache.entries.for_each([](uint16_t, ObjectDrawCache::Entry &e) { e.used = false; });
     cache.placed.clear();
     cache.placed_items.clear();
     cache.placed_in_order = 0;
     g_compose_step = "placing the objects";
+    g_compose_profile.resets_ms += since(t_resets);
     auto t_part = PClock::now();
     // Where each object is: kept while the objects' places are the same (cache.position_version),
     // pointed at the caller's list again; else placed anew. Then in the frame's order for this
@@ -1776,6 +2102,8 @@ void compose_frame(const LotScene &scene, const Lot &lot, const std::vector<LotO
         bool instanced = false;
     };
     std::vector<Job> jobs;
+    uint32_t parked = 0;      // pending objects left far off the screen in this view (not jobs)
+    size_t parked_now = 0;    // jobs left so this frame
     std::vector<ObjectDrawCache::Entry *> entry_of;   // each placed object's entry, in `placed` order
     entry_of.reserve(placed.size());
     const float mid_x = view ? (view->x0 + view->x1) / 2 : 0.0f, mid_y = view ? (view->y0 + view->y1) / 2 : 0.0f;
@@ -1888,7 +2216,9 @@ void compose_frame(const LotScene &scene, const Lot &lot, const std::vector<LotO
                                 int(o.id), di->label.c_str(), on.tx, on.ty, int(fresh), int(e.cut_hidden),
                                 (unsigned long)e.cmds.size(), scene.generation, e.cut_for);
         }
-        if (e.pending) {   // its draws made below: the nearest the view's middle first
+        if (e.pending && view && e.parked_view == cache.view_stamp) {
+            parked++;   // (left far off the screen in this view: until it moves)
+        } else if (e.pending) {   // its draws made below: the nearest the view's middle first
             float bx, by;
             scene.projector.box(on.pl.x, on.pl.y, on.pl.z, bx, by);
             const float dx = bx - mid_x, dy = by - mid_y;
@@ -1913,11 +2243,51 @@ void compose_frame(const LotScene &scene, const Lot &lot, const std::vector<LotO
     }();
     // With a deadline: what's left of the frame after the Sims, the lighting and the drawing to
     // come (~12 ms at Solana), at least 3 ms so pending objects always come in; else the fixed budget.
+    // Uncapped (g_compose_frame_ms under 25), a frame's share of the usual pace is the share of a 33 ms
+    // frame that the time since the last compose is, a quarter at least: 24 objects looked at and 3 ms at
+    // least a frame are twice as much a second at 60 fps, and a busy lot's far zoom was all decoded at
+    // once (the soaks at 60 fps everywhere: 39 MB of sprites and run-outs; 27-34 MB capped). Capped: 1.
+    double share = 1.0;
+    {
+        const double now_ms = std::chrono::duration<double, std::milli>(PClock::now().time_since_epoch()).count();
+        if (g_compose_frame_ms < 25.0 && cache.last_paced_ms > 0)
+            share = std::clamp((now_ms - cache.last_paced_ms) / 33.3, 0.25, 1.0);
+        cache.last_paced_ms = now_ms;
+    }
     const double budget_ms = left_at_start < 0 || TS_ENV("TS_REDRAW_MS")
                                  ? fixed_budget_ms
-                                 : std::clamp(time_left() - 12.0, 3.0, fixed_budget_ms);
+                                 : std::clamp(time_left() - 12.0, 3.0 * share, fixed_budget_ms);
     if (left_at_start >= 0 && budget_ms < fixed_budget_ms && jobs.size() > 1)
         lean = true;
+    // A new view (a turn, a zoom): what is in the view drawn now, in the frame that made the scene anew
+    // (a long one anyway: 150-190 ms on the Vita) and the few after it, not 7 objects a frame over the
+    // next 12-20 (the main Vita, 2026-11-16: 75 objects in view, their pictures all in memory, 0.4-0.7 s
+    // of them popping in). Up to 60 ms of it in the first frame (~0.3 ms an object on three cores), 8 ms
+    // in the next ones; objects out of the view keep to the usual limits. Not where there is no budget
+    // (the PC, shots). TS_TURN_FILL_OLD=1: as before.
+    static const bool fill_old = TS_ENV("TS_TURN_FILL_OLD") != nullptr;
+    bool fresh = !fill_old && view && budget_ms > 0 && cache.fresh_view > 0;
+    if (fresh && sprites.bytes() >= cache.fresh_sprite_limit) {   // (memory: see fresh_sprite_limit)
+        fresh = false;
+        g_compose_profile.fresh_stopped++;
+    }
+    const double fresh_ms = !fresh ? 0.0 : cache.fresh_view == 12 ? 60.0 : cache.fresh_view == 11 ? 30.0 : std::max(budget_ms, 12.0);
+    if (cache.fresh_view > 0)
+        cache.fresh_view--;
+    size_t looked_out = 0;
+    size_t limit_checked_at = SIZE_MAX;
+    const size_t look_cap = std::max<size_t>(4, size_t(24.0 * share + 0.5));   // (a frame's share: the same a second)
+    // The Sims' poses, started on the pool before this and finished after the objects, keep it "busy", and
+    // a busy pool leaves every object batch to this thread alone: a turn's frame drew its 50-190 objects
+    // one after another (60 ms of drawing in 65 ms: the main Vita, 2026-11-16). In a new view's frames the
+    // poses are finished first (they are on the workers already: a few ms), so the objects go three and
+    // four at a time. TS_TURN_POSES_OLD=1: as before.
+    static const bool poses_old = TS_ENV("TS_TURN_POSES_OLD") != nullptr;
+    if (fresh && !poses_old && jobs.size() > 8 && pose_pool().busy()) {
+        const auto t_sim = PClock::now();
+        pose_pool().finish([] { return false; });
+        sims_ms += since(t_sim);
+    }
     // With a reader (the viewer's thread: cache.read_ahead), the card is its alone: an object whose
     // sprites are taken out of its file and not read ahead yet asks for them and waits (up to two
     // seconds, then reads them itself), so a batch never waits on the card (three threads reading
@@ -1943,6 +2313,20 @@ void compose_frame(const LotScene &scene, const Lot &lot, const std::vector<LotO
         ready.clear();
     };
     g_compose_profile.jobs_n += int(jobs.size());
+    // (The cache's size is a walk of it: asked once, and only where there is a limit and something to make.)
+    bool over_sprites = false;
+    if (view && cache.offscreen_sprite_limit != SIZE_MAX && !jobs.empty()) {
+        static const bool walk_always = TS_ENV("TS_SPRITE_BYTES_ALWAYS") != nullptr;   // debug: walked each time, as before
+        if (walk_always || cache.sprite_bytes_age < 0 || cache.sprite_bytes_age >= 7) {
+            const auto t_bytes = PClock::now();
+            cache.sprite_bytes_seen = sprites.bytes();
+            cache.sprite_bytes_age = 0;
+            g_compose_profile.sprite_bytes_ms += since(t_bytes);
+        } else {
+            cache.sprite_bytes_age++;
+        }
+        over_sprites = cache.sprite_bytes_seen >= cache.offscreen_sprite_limit;
+    }
     // What was asked of the read-ahead is asked again after a while: the store lets go of what
     // wasn't used, and an object waiting on sprites let go waited for ever.
     if (++cache.requested_age >= 60) {
@@ -1950,19 +2334,41 @@ void compose_frame(const LotScene &scene, const Lot &lot, const std::vector<LotO
         cache.requested_age = 0;
     }
     for (Job &j : jobs) {
-        if (budget_ms > 0 && (since(t_jobs) > budget_ms || looked > 24))   // (the rest another frame)
+        if (fresh && (looked & 7) == 7 && looked != limit_checked_at) {   // (every eighth looked at: the cache counts its all)
+            limit_checked_at = looked;
+            if (!ready.empty())
+                run_batch();
+            if (sprites.bytes() >= cache.fresh_sprite_limit) {
+                fresh = false;   // (the pictures made so far in this frame took it over the limit: the usual pace from here)
+                g_compose_profile.fresh_stopped++;
+            }
+        }
+        if (fresh) {
+            if (since(t_jobs) > fresh_ms)
+                break;
+            float bx, by;
+            scene.projector.box(j.on->pl.x, j.on->pl.y, j.on->pl.z, bx, by);
+            const bool in_view = bx >= view->x0 - 64 && bx <= view->x1 + 64 && by >= view->y0 - 64 && by <= view->y1 + 128;
+            if (!in_view && (since(t_jobs) > budget_ms || ++looked_out > look_cap))   // (out of it: the usual limits)
+                continue;
+        } else if (budget_ms > 0 && (since(t_jobs) > budget_ms || looked > look_cap)) {   // (the rest another frame)
             break;
+        }
         // Late (the deadline): an object well off the screen isn't drawn afresh this frame. The
         // tills and signs at Solana animate every tick, and drawing the ones out of view again
         // each frame was ~1 ms apiece; pending, they're drawn as soon as the view reaches them.
         // (Not counted as looked at: some 200 of them queue up, and the ones on screen behind
         // them in the list must still be reached.)
-        if (lean && view) {
+        // The same while the sprite cache is over its budget, late or not (offscreen_sprite_limit). And one
+        // left so isn't made a job of again until the view moves (Entry::parked_view).
+        if ((lean || over_sprites) && view) {
             float bx, by;
             scene.projector.box(j.on->pl.x, j.on->pl.y, j.on->pl.z, bx, by);
             constexpr float kMargin = 400;
             if (bx < view->x0 - kMargin || bx > view->x1 + kMargin || by < view->y0 - kMargin || by > view->y1 + kMargin) {
                 g_compose_profile.jobs_offscreen++;
+                j.e->parked_view = cache.view_stamp;
+                parked_now++;
                 if (++skipped > 64)   // (nearest first: past this many off screen, the rest are further out)
                     break;
                 continue;
@@ -2038,6 +2444,18 @@ void compose_frame(const LotScene &scene, const Lot &lot, const std::vector<LotO
             if (missing) {
                 j.e->waits++;
                 g_compose_profile.jobs_waiting++;
+                static const bool wait_log = TS_ENV("TS_WAIT_LOG") != nullptr;
+                if (wait_log && (j.e->waits == 10 || j.e->waits == 30 || j.e->waits == 59)) {
+                    const ObjectInfo *di = content.object(j.on->pl.object->guid);
+                    std::printf("waiting %d frames: #%d %s, %lu windows, asked-set %lu (age %d), store %lu KB\n", int(j.e->waits),
+                                int(j.on->pl.object->id), di ? di->label.c_str() : "?", (unsigned long)windows.size(),
+                                (unsigned long)cache.requested.size(), cache.requested_age, (unsigned long)(read_ahead_bytes() / 1024));
+                    for (const FileRef &w : windows)
+                        std::printf("    @%llu +%u: %s, %s; %s\n", (unsigned long long)w.offset, unsigned(w.size),
+                                    read_ahead_has(w) ? "in the store" : "not in the store",
+                                    cache.requested.count(std::make_tuple(w.path, w.offset, w.size)) ? "asked" : "not asked",
+                                    cache.read_ahead_where ? cache.read_ahead_where(w).c_str() : "");
+                }
                 continue;
             }
         }
@@ -2091,7 +2509,20 @@ void compose_frame(const LotScene &scene, const Lot &lot, const std::vector<LotO
         e.version = ++cache.next_version;
         e.pending = false;
     }
-    cache.pending_left = drawn < jobs.size();
+    {   // The objects in the view still without their draws after this compose: what pops in later.
+        int left = 0;
+        if (view)
+            for (const Job &j : jobs)
+                if (!j.drawn) {
+                    float bx, by;
+                    scene.projector.box(j.on->pl.x, j.on->pl.y, j.on->pl.z, bx, by);
+                    if (bx >= view->x0 - 64 && bx <= view->x1 + 64 && by >= view->y0 - 64 && by <= view->y1 + 128)
+                        left++;
+                }
+        g_compose_profile.onscreen_left = left;
+    }
+    cache.parked = parked + uint32_t(parked_now);
+    cache.pending_left = drawn + parked_now < jobs.size();   // (those left off the screen wait for the view, not the next frame)
     if (!cache.pending_left)
         cache.requested.clear();
     g_compose_step = "placing the draws";
@@ -2121,7 +2552,7 @@ void compose_frame(const LotScene &scene, const Lot &lot, const std::vector<LotO
         order_key(on, at, order);
         if (k < cache.placed_sorted)   // (a kept placement, in order; the free ones come after, merged in below)
             cache.placed_in_order = cache.placed.size() + 1;
-        cache.placed.push_back({ at, order, &e.cmds, &e.bounds });
+        cache.placed.push_back({ at, order, &e.cmds, &e.bounds, { e.x0, e.y0, e.x1, e.y1 } });
     }
     g_compose_profile.place_draws_ms += since(t_place_draws);
     cache.entries.erase_unused();   // objects that are gone
@@ -2146,7 +2577,42 @@ void compose_frame(const LotScene &scene, const Lot &lot, const std::vector<LotO
     static const bool shadow_why = TS_ENV("TS_SHADOW_WHY") != nullptr;
     static std::map<uint16_t, std::pair<uint64_t, std::string>> why_last;
     std::map<uint16_t, std::pair<uint64_t, std::string>> why_now;
+    // The objects' part of it from the caller, made with their list (cache.shadow_version), else walked here.
+    static const bool key_walked = TS_ENV("TS_SHADOW_KEY_WALKED") != nullptr;   // debug: walked, as before
+    const bool key_given = cache.shadow_version != 0 && !shadow_why && !key_walked;
+    static const bool key_check = TS_ENV("TS_SHADOW_KEY_CHECK") != nullptr;   // debug: the given number against the walked one
+    if (key_check && cache.shadow_version != 0) {
+        uint64_t walked = 1469598103934665603ull;
+        auto mix_walked = [&walked](int64_t v) {
+            walked ^= uint64_t(v);
+            walked *= 1099511628211ull;
+        };
+        for (const PlacedOn &on : placed) {
+            const LotObject &o = *on.pl.object;
+            if (on.pl.depth != 0 || o.x < 0 || o.free)
+                continue;
+            mix_walked(int64_t(o.id) << 32 | o.guid);
+            mix_walked(int64_t(o.x) << 48 | int64_t(uint16_t(o.y)) << 32 | int64_t(uint16_t(o.level)) << 16 | uint16_t(on.level));
+            mix_walked(int64_t(uint16_t(o.direction())) << 32 | int64_t(uint16_t(o.data[34])) << 16 | (o.data[kObjFlags] & 4));
+        }
+        g_compose_profile.shadow_key_checked++;
+        const bool same_scene = cache.shadow_check_scene == scene.generation && cache.shadow_check_top == scene.top_level;
+        if (cache.shadow_check_walked != 0 && same_scene && walked != cache.shadow_check_walked &&
+            cache.shadow_version == cache.shadow_check_given) {
+            if (g_compose_profile.shadow_key_missed++ < 20)
+                std::printf("shadows' number: the walked one changed and the given one did not (%llu)\n",
+                            (unsigned long long)cache.shadow_version);
+        }
+        cache.shadow_check_walked = walked;
+        cache.shadow_check_given = cache.shadow_version;
+        cache.shadow_check_scene = scene.generation;
+        cache.shadow_check_top = scene.top_level;
+    }
+    if (key_given)
+        mix(int64_t(cache.shadow_version));
     for (const PlacedOn &on : placed) {
+        if (key_given)
+            break;
         const LotObject &o = *on.pl.object;
         if (on.pl.depth != 0 || o.x < 0 || o.free)
             continue;
@@ -2182,6 +2648,7 @@ void compose_frame(const LotScene &scene, const Lot &lot, const std::vector<LotO
     if (shadow_why)
         why_last = std::move(why_now);
     const bool shadows_changed = key != cache.shadows_key || cache.shadows_key == 0;
+    g_compose_profile.shadow_key_ms += since(t_part);
     if (shadows_changed && cache.shadows_key != 0 && time_left() < 8.0) {
         // Late: the shadows as they were this frame, made again next frame (the key kept old, so
         // they are); a shadow a frame late is nothing to the eye. Downtown something's hidden flag
@@ -2196,40 +2663,87 @@ void compose_frame(const LotScene &scene, const Lot &lot, const std::vector<LotO
         cache.shadow_bounds[l].clear();
         cache.shadow_items[l].clear();
     }
-    std::set<std::pair<int, int>> shaded[kLotLevels];
-    // The tiles' objects, for the multi-tile shapes (shadow_code): made only if an object's shadow
-    // has to be worked out afresh.
-    TileObjects by_tile;
+    // A rebuild makes nothing on the heap that it made the last time (the Vita, the diner at speed 3: a car
+    // crossing a tile made the shadows again ten times a second, and each time some 500 look-ups of the
+    // objects' kinds, a map of the groups, one of the tiles' parts and a set of the shaded tiles were made and
+    // let go, the poses' threads allocating beside it: 3.3 ms a rebuild, 2026-11-19): what an object's kind
+    // says is kept by its id (cache.shadow_kinds), the groups are numbered, the shaded tiles a grid of stamps,
+    // and the tiles' parts are listed only when a shadow has to be worked out afresh.
+    static thread_local std::vector<uint32_t> shaded_at;   // by storey and tile: the rebuild that shaded it
+    static thread_local uint32_t shaded_stamp = 0;
+    const int shaded_size = std::max(lot.size, 1);
+    if (shaded_at.size() != size_t(kLotLevels) * size_t(shaded_size) * size_t(shaded_size) || ++shaded_stamp == 0) {
+        shaded_at.assign(size_t(kLotLevels) * size_t(shaded_size) * size_t(shaded_size), 0);
+        shaded_stamp = 1;
+    }
+    std::set<std::pair<int, int>> shaded_beyond[kLotLevels];   // (a tile off the grid: none in a sound lot)
+    auto shaded_slot = [&](int level, int x, int y) -> uint32_t * {
+        if (x < 0 || y < 0 || x >= shaded_size || y >= shaded_size)
+            return nullptr;
+        return &shaded_at[(size_t(level) * size_t(shaded_size) + size_t(y)) * size_t(shaded_size) + size_t(x)];
+    };
+    auto is_shaded = [&](int level, int x, int y) {
+        const uint32_t *slot = shaded_slot(level, x, y);
+        return slot ? *slot == shaded_stamp : shaded_beyond[level].count({ x, y }) != 0;
+    };
+    auto set_shaded = [&](int level, int x, int y) {
+        if (uint32_t *slot = shaded_slot(level, x, y))
+            *slot = shaded_stamp;
+        else
+            shaded_beyond[level].insert({ x, y });
+    };
+    // Each group's placed parts, for the multi-tile shapes (shadow_code): listed only if an object's shadow
+    // has to be worked out afresh (their room kept between rebuilds).
+    std::vector<std::vector<const LotObject *>> &group_parts = cache.shadow_parts;
+    bool parts_listed = false;
     // Each multi-tile group's state (its parts' ids and places): a part's shadow shape depends on
     // its group's other parts, so a part's memo holds while its group is as it was.
     static const bool memo_off = TS_ENV("TS_SHADOW_MEMO_OFF") != nullptr;   // debug: every shadow afresh, as before
     const auto t_pre = PClock::now();
-    std::unordered_map<uint64_t, uint64_t> group_fp;
-    auto group_of = [&](const ObjectInfo &info) -> uint64_t {
-        const uint16_t master = info.objd.get(Objd::MasterID);
-        if (master == 0)
-            return 0;
-        return std::hash<std::string>{}(info.ref.path) * 31 + uint64_t(info.ref.offset) * 7 + master;
+    // What an object's kind says of its shadow (cache.shadow_kinds), read from its info when its id is met first
+    // or holds another object now.
+    auto kind_of = [&](const LotObject &o) -> const ObjectDrawCache::ShadowKind & {
+        if (o.id >= cache.shadow_kinds.size())
+            cache.shadow_kinds.resize(size_t(o.id) + 64);
+        ObjectDrawCache::ShadowKind &kind = cache.shadow_kinds[o.id];
+        if (kind.known && kind.guid == o.guid)
+            return kind;
+        kind = ObjectDrawCache::ShadowKind();
+        kind.known = true;
+        kind.guid = o.guid;
+        const ObjectInfo *info = content.object(o.guid);
+        if (!info) {
+            kind.none = true;
+            return kind;
+        }
+        const uint16_t type = info->objd.get(Objd::ObjectType);
+        // (A person or a cursor; a part on the storey above, the stairs' top: its shadow would fall in the
+        // stairwell.)
+        kind.level_offset = info->objd.get(Objd::LevelOffset) != 0;
+        kind.none = type == 2 || type == 9 || kind.level_offset;
+        kind.shadow = int16_t(info->objd.get(Objd::Shadow));
+        kind.sub = int16_t(info->objd.get(Objd::SubIndex));
+        if (const uint16_t master = info->objd.get(Objd::MasterID))
+            kind.group = cache.shadow_groups
+                             .try_emplace(std::make_tuple(info->ref.path, uint64_t(info->ref.offset), master),
+                                          uint32_t(cache.shadow_groups.size()) + 1)
+                             .first->second;
+        return kind;
     };
-    // Each placed object's info looked up once (the objects' pass reuses it), the multi-tile parts'
-    // groups and tiles noted: shadow_code looks only for parts of the same object, so its tile map
-    // holds only those (all 760 objects of a downtown lot were put in it at every rebuild).
-    std::vector<const ObjectInfo *> infos(placed.size(), nullptr);
-    std::vector<uint64_t> groups(placed.size(), 0);
+    // The multi-tile parts' groups noted: shadow_code looks only for parts of the same object, so its tile
+    // map holds only those (all 760 objects of a downtown lot were put in it at every rebuild).
+    std::vector<uint64_t> &group_fp = cache.shadow_group_fp;
+    group_fp.assign(cache.shadow_groups.size() + 1, 0);
     for (size_t k = 0; k < placed.size(); k++) {
         const LotObject &o = *placed[k].pl.object;
         if (o.x < 0)
             continue;
-        const ObjectInfo *info = content.object(o.guid);
-        infos[k] = info;
-        if (!info)
-            continue;
-        if (const uint64_t g = group_of(*info)) {
-            groups[k] = g;
+        if (const uint32_t g = kind_of(o).group) {
+            if (g >= group_fp.size())
+                group_fp.resize(size_t(g) + 1, 0);
             uint64_t &h = group_fp[g];
             h = (h ^ (uint64_t(o.id) << 40 | uint64_t(uint16_t(o.x)) << 24 | uint64_t(uint16_t(o.y)) << 8 | uint64_t(uint8_t(o.level)))) *
                 1099511628211ull;
-            by_tile[tile_key(o.level, o.x, o.y)].push_back(&o);
         }
     }
     g_compose_profile.shadow_pre_ms += since(t_pre);
@@ -2239,16 +2753,11 @@ void compose_frame(const LotScene &scene, const Lot &lot, const std::vector<LotO
         const PlacedOn &on = placed[k];
         const LotObject &o = *on.pl.object;
         if (no_shadows || on.pl.depth != 0 || o.x < 0 || o.free || on.level < 0 || on.level >= kLotLevels ||
-            on.level > scene.top_level || shaded[on.level].count({ o.x, o.y }))
+            on.level > scene.top_level || is_shaded(on.level, o.x, o.y))
             continue;
-        const ObjectInfo *info = infos[k];
-        if (!info || o.data[34] != 0 || (o.data[kObjFlags] & 4))
+        const ObjectDrawCache::ShadowKind kind = kind_of(o);
+        if (kind.none || o.data[34] != 0 || (o.data[kObjFlags] & 4))
             continue;
-        const uint16_t type = info->objd.get(Objd::ObjectType);
-        if (type == 2 || type == 9)
-            continue;
-        if (info->objd.get(Objd::LevelOffset) != 0)
-            continue;   // a part on the storey above (the stairs' top): its shadow would fall in the stairwell
         // What this shadow is made from: the object as it stands, its group, the view.
         uint64_t fp = 1469598103934665603ull;
         for (const int64_t v : { int64_t(o.id) << 32 | o.guid, int64_t(o.x) << 32 | uint32_t(o.y), int64_t(o.level) << 32 | uint32_t(on.level),
@@ -2257,13 +2766,13 @@ void compose_frame(const LotScene &scene, const Lot &lot, const std::vector<LotO
             fp ^= uint64_t(v);
             fp *= 1099511628211ull;
         }
-        if (groups[k])
-            fp = (fp ^ group_fp[groups[k]]) * 1099511628211ull;
+        if (kind.group)
+            fp = (fp ^ group_fp[kind.group]) * 1099511628211ull;
         if (!memo_off)
             if (auto m = cache.shadow_memo.find(o.id); m != cache.shadow_memo.end() && m->second.fp == fp &&
                                                        (!m->second.casts || (m->second.cmd.image && m->second.cmd.image->has_pixels()))) {
                 if (m->second.casts) {
-                    shaded[on.level].insert({ o.x, o.y });
+                    set_shaded(on.level, o.x, o.y);
                     cache.shadows[on.level].push_back(m->second.cmd);
                     cache.shadow_bounds[on.level].push_back(m->second.bounds);
                     cache.shadow_items[on.level].push_back(m->second.item);
@@ -2276,14 +2785,31 @@ void compose_frame(const LotScene &scene, const Lot &lot, const std::vector<LotO
         memo.stamp = stamp;
         g_compose_profile.shadow_misses++;
         memo.fp = fp;
-        int code = shadow_code(o, *info, by_tile, content);
+        if (!parts_listed) {
+            parts_listed = true;
+            for (auto &parts : group_parts)
+                parts.clear();
+            for (const PlacedOn &other : placed) {
+                const LotObject &part = *other.pl.object;
+                if (part.x < 0)
+                    continue;
+                if (const uint32_t g = kind_of(part).group) {
+                    if (g >= group_parts.size())
+                        group_parts.resize(size_t(g) + 1);
+                    group_parts[g].push_back(&part);
+                }
+            }
+        }
+        static const std::vector<const LotObject *> no_parts;
+        int code = shadow_code(o, kind, kind.group && kind.group < group_parts.size() ? group_parts[kind.group] : no_parts, kind_of);
         if (code < 0) {
             cache.shadow_memo[o.id] = memo;   // (casts none: remembered too)
             continue;
         }
-        if (code < 0)
-            continue;
-        shaded[on.level].insert({ o.x, o.y });
+        set_shaded(on.level, o.x, o.y);
+        const ObjectInfo *info = content.object(o.guid);
+        if (!info)
+            continue;   // (its kind says there is one)
         if (TS_ENV("TS_SHADOW_LIST"))   // debug: each object casting a shadow
             std::printf("shadow under #%d %s at (%d, %d) level %d: code %d brightness %d\n", int(o.id), info->label.c_str(), o.x, o.y,
                         on.level, code, int(info->objd.get(Objd::ShadowBrightness)));
@@ -2291,7 +2817,13 @@ void compose_frame(const LotScene &scene, const Lot &lot, const std::vector<LotO
             code = rotate_shadow_code(code, o.direction() / 2 + scene.rotation);
         // (The brightness kept to 0-255: a negative one made a solid black blob, the 2026-11-01 report.)
         const int brightness = std::clamp(int(int16_t(info->objd.get(Objd::ShadowBrightness))), 0, 255);
-        const Image *img = shadow_picture(content, sprites, code, scene.projector.m.zoom_index, brightness);
+        const uint32_t picture = uint32_t(code & 0xffff) << 16 | uint32_t(scene.projector.m.zoom_index & 0xff) << 8 | uint32_t(brightness);
+        const Image *img = nullptr;
+        if (auto kept = cache.shadow_pictures.find(picture);
+            kept != cache.shadow_pictures.end() && kept->second && kept->second->has_pixels())
+            img = kept->second;
+        else
+            cache.shadow_pictures[picture] = img = shadow_picture(content, sprites, code, scene.projector.m.zoom_index, brightness);
         if (!img) {
             cache.shadow_memo[o.id] = memo;
             continue;
@@ -2302,7 +2834,8 @@ void compose_frame(const LotScene &scene, const Lot &lot, const std::vector<LotO
         p.box(float(o.x), float(o.y), z, bx, by);
         DrawCmd cmd;
         {
-            DrawList one;
+            static thread_local DrawList one;   // (its room kept)
+            one.cmds.clear();
             one.sprite(*img, int(bx) + p.m.floor_x, int(by) + p.m.floor_y)
                 .set_plane(floor_depth(back_corner_depth(p, float(o.x), float(o.y), z), p.m.zoom_index, float(int(by) + p.m.floor_y)));
             cmd = one.cmds.back();
@@ -2338,7 +2871,7 @@ void compose_frame(const LotScene &scene, const Lot &lot, const std::vector<LotO
     }
     const auto t_order = PClock::now();
     for (const ObjectDrawCache::Placed &p : cache.placed)
-        inserts.push_back({ p.at, p.order, p.cmds, nullptr, p.bounds });
+        inserts.push_back({ p.at, p.order, p.cmds, nullptr, p.bounds, p.box, true });
     for (int l = 0; l < kLotLevels; l++)   // the shadows, over the storey's floors before all else
         if (!cache.shadows[l].empty())
             inserts.push_back({ scene.floors_end[l], kShadowOrder, &cache.shadows[l], nullptr, &cache.shadow_bounds[l] });
@@ -2349,7 +2882,8 @@ void compose_frame(const LotScene &scene, const Lot &lot, const std::vector<LotO
     }
     // The Sims in view, posed (those whose pose changed, each on its own thread of the pool:
     // the posing is the most of a frame's work), then put among the lot where their body is.
-    {   // The poses, finished: the parts left here taken, until the frame has no more time.
+    g_compose_profile.inserts_ms += since(t_order);
+    if (!behind) {   // The poses, finished: the parts left here taken, until the frame has no more time.
         const auto t_sim = PClock::now();
         g_compose_step = "posing the Sims";
         const int undone = pose_pool().finish([&] { return time_left() < 2.0; });
@@ -2357,8 +2891,10 @@ void compose_frame(const LotScene &scene, const Lot &lot, const std::vector<LotO
             g_compose_profile.sims_deferred += undone;
             lean = true;
         }
+        take_poses();
         sims_ms += since(t_sim);
     }
+    const auto t_sims_place = PClock::now();
     if (lean)
         g_compose_profile.lean_frames++;
     for (const LiveSim *sp : shown) {
@@ -2402,28 +2938,116 @@ void compose_frame(const LotScene &scene, const Lot &lot, const std::vector<LotO
     std::stable_sort(extras, inserts.end(), before);
     std::inplace_merge(inserts.begin(), extras, inserts.end(), before);
     g_compose_step = "the frame's list";
-    g_compose_profile.objects_ms += since(t_objects);
+    g_compose_profile.sims_place_ms += since(t_sims_place);
+    // (The wait for the poses is the Sims' time, not the objects': it was in both, and taken off the copy's,
+    // which so read 3 ms where it took 7: the main Vita, 2026-11-18.)
+    g_compose_profile.objects_ms += since(t_objects) - sims_ms;
     g_compose_profile.order_ms += since(t_order) - sims_ms;
+    // The Sims' items (for the kept picture's diff), the pieces kept for copy_frame, and the Sims gone or out
+    // of view let go: all before the frame's list, which may be the caller's to make (defer_copy).
+    if (items)
+        for (const Insert &in : inserts)
+            if (!in.cmds) {
+                const LiveSim &s = *in.sim;
+                const ObjectDrawCache::SimEntry &kept = cache.sims[s.id];
+                const DrawMesh &mesh = *kept.mesh;
+                items->push_back({ 0x10000u + s.id, kept.version, mesh.x0, mesh.y0, mesh.x1, mesh.y1 });
+            }
+    cache.frame_inserts.clear();
+    cache.frame_inserts.reserve(inserts.size());
+    for (const Insert &in : inserts)
+        cache.frame_inserts.push_back({ in.at, in.order, in.cmds, in.bounds, uint16_t(in.sim ? in.sim->id : 0), in.box, in.boxed });
+    cache.frame_inserts_generation = scene.generation;
+    for (auto it = cache.sims.begin(); it != cache.sims.end();) {   // Sims gone or out of view
+        if (!it->second.used && cache.double_buffer) {   // (the frame being drawn may point at theirs)
+            if (it->second.mesh)
+                cache.retired.push_back(std::move(it->second.mesh));
+            if (it->second.spare)
+                cache.retired.push_back(std::move(it->second.spare));
+            if (it->second.third)
+                cache.retired.push_back(std::move(it->second.third));
+        }
+        it = it->second.used ? std::next(it) : cache.sims.erase(it);
+    }
+    g_compose_profile.sims_ms += sims_ms;
+    if (!cache.defer_copy)
+        copy_frame(scene, cache, out, out_bounds, view);
+    g_compose_step = "done";
+}
+
+void copy_frame(const LotScene &scene, ObjectDrawCache &cache, DrawList &out, std::vector<DrawBounds> *out_bounds,
+                const DrawBounds *view, const std::vector<DrawBounds> *areas, bool for_frame)
+{
+    using PClock = ts::FastClock;
     const auto t_copy = PClock::now();
+    constexpr int kShadowOrder = std::numeric_limits<int>::min();
     out.cmds.clear();
+    if (out_bounds)
+        out_bounds->clear();
+    const bool have_bounds = out_bounds && scene.bounds.size() == scene.list.cmds.size();
+    if (!have_bounds)
+        areas = nullptr;   // (a scene without its draws' bounds: everything)
+    // The areas as a grid of 32-pixel cells over their bounds: a draw is kept when a cell it lies on is marked.
+    // (Only the main thread makes frames: one grid, not one a thread, which on the Vita is a call at every use.
+    // The first try, with that and four floor() calls a draw, walked the diner's 5,800 draws in 8.9 ms where
+    // copying them all took 7.5: the main Vita, 2026-11-18.)
+    constexpr int kCell = 32;
+    constexpr float kPerCell = 1.0f / kCell;
+    static std::vector<uint8_t> grid;
+    int gw = 0, gh = 0;
+    float gx0 = 0, gy0 = 0, gx1 = 0, gy1 = 0;
+    if (areas && !areas->empty()) {
+        DrawBounds u{ 1e9f, 1e9f, -1e9f, -1e9f };
+        for (const DrawBounds &a : *areas)
+            u = { std::min(u.x0, a.x0), std::min(u.y0, a.y0), std::max(u.x1, a.x1), std::max(u.y1, a.y1) };
+        gx0 = std::floor(u.x0), gy0 = std::floor(u.y0);
+        gw = int((u.x1 - gx0) / kCell) + 1, gh = int((u.y1 - gy0) / kCell) + 1;
+        if (gw <= 0 || gh <= 0 || gw > 1024 || gh > 1024) {
+            areas = nullptr;   // (not a screen's worth: everything)
+            gw = gh = 0;
+        } else {
+            gx1 = gx0 + float(gw * kCell), gy1 = gy0 + float(gh * kCell);
+            grid.assign(size_t(gw) * size_t(gh), 0);
+            for (const DrawBounds &a : *areas) {
+                const int cx0 = std::clamp(int((a.x0 - gx0) / kCell), 0, gw - 1), cx1 = std::clamp(int((a.x1 - gx0) / kCell), 0, gw - 1);
+                const int cy0 = std::clamp(int((a.y0 - gy0) / kCell), 0, gh - 1), cy1 = std::clamp(int((a.y1 - gy0) / kCell), 0, gh - 1);
+                for (int cy = cy0; cy <= cy1; cy++)
+                    for (int cx = cx0; cx <= cx1; cx++)
+                        grid[size_t(cy) * size_t(gw) + size_t(cx)] = 1;
+            }
+        }
+    }
+    const uint8_t *const cells = grid.data();
+    auto touches = [&](const DrawBounds &b) {
+        if (gw == 0 || b.x1 < gx0 || b.y1 < gy0 || b.x0 >= gx1 || b.y0 >= gy1)
+            return false;
+        const int cx0 = b.x0 <= gx0 ? 0 : int((b.x0 - gx0) * kPerCell), cx1 = std::min(int((b.x1 - gx0) * kPerCell), gw - 1);
+        const int cy0 = b.y0 <= gy0 ? 0 : int((b.y0 - gy0) * kPerCell), cy1 = std::min(int((b.y1 - gy0) * kPerCell), gh - 1);
+        for (int cy = cy0; cy <= cy1; cy++) {
+            const uint8_t *row = cells + size_t(cy) * size_t(gw);
+            for (int cx = cx0; cx <= cx1; cx++)
+                if (row[cx])
+                    return true;
+        }
+        return false;
+    };
     // (A Sim is one draw here, its mesh: 1500 each, as for its triangles before, was 2.4 MB of the
     // block for nothing with Solana's 11.)
-    reserve_draws(out.cmds, scene.list.cmds.size() + cache.placed.size() * 4 + sims.size());
-    size_t from = 0;
-    CharacterLibrary &library = sprites.characters();
-    // The scene's list from `from` up to `to`, noting where each storey's floors end in the frame.
-    // The draws' bounds alongside, where asked (the scene's and the objects' worked out before).
-    if (out_bounds) {
-        out_bounds->clear();
-        out_bounds->reserve(out.cmds.capacity());
+    if (!areas) {
+        size_t sims = 0;
+        for (const ObjectDrawCache::FrameInsert &in : cache.frame_inserts)
+            sims += in.cmds ? 0 : 1;
+        reserve_draws(out.cmds, scene.list.cmds.size() + cache.placed.size() * 4 + sims);
+        if (out_bounds)
+            out_bounds->reserve(out.cmds.capacity());
     }
-    const bool have_bounds = out_bounds && scene.bounds.size() == scene.list.cmds.size();
+    size_t from = 0;
     // Only what is on or near the screen goes into the frame: the rest of a lot's thousands of
     // draws (the grass's triangles, the far rooms' floors and walls, the objects out of view)
     // would be lit, copied, diffed and culled by the renderer every frame for nothing (the pet
     // shop's 9,400 draws with 230 on screen: ~15 ms a frame on the Vita, 2026-10-31). A margin
     // keeps what a pan exposes before the next frame; the frame's own diff sees what enters and
-    // leaves. TS_NO_FRAME_CULL=1 keeps every draw, to compare.
+    // leaves. TS_NO_FRAME_CULL=1 keeps every draw, to compare. With `areas`, only what touches them.
     static const bool no_cull = TS_ENV("TS_NO_FRAME_CULL") != nullptr;
     const bool cull = view && have_bounds && !no_cull;
     constexpr float kCullMargin = 96;
@@ -2431,11 +3055,51 @@ void compose_frame(const LotScene &scene, const Lot &lot, const std::vector<LotO
         return !(b.x1 < view->x0 - kCullMargin || b.x0 > view->x1 + kCullMargin || b.y1 < view->y0 - kCullMargin ||
                  b.y0 > view->y1 + kCullMargin);
     };
+    // By the grid first (most draws lie on no marked cell), then by the areas themselves, with the test the kept
+    // picture's filter and the depth pass use: by the cells alone the diner's far view kept 1,100 draws a frame
+    // for the 3% of the screen that changed (a Sim's 20 x 45 pixels marks 64 x 96), each some 2 us to copy.
+    auto meets = [&](const DrawBounds &b) {
+        for (const DrawBounds &a : *areas)
+            if (b.x1 > a.x0 && b.x0 < a.x1 && b.y1 > a.y0 && b.y0 < a.y1)
+                return true;
+        return false;
+    };
+    auto keep = [&](const DrawBounds &b) { return (!cull || near_view(b)) && (!areas || (touches(b) && meets(b))); };
+    const size_t scene_end = scene.list.cmds.size();
+    // The scene's draws' bounds in sixteens, made once a scene: a sixteen none of which can be kept is passed
+    // over by one test (as an object's draws are by its box, below).
+    constexpr size_t kBlock = 16;
+    const bool picking = cull || areas;   // (draw by draw, by their bounds)
+    if (picking && (cache.scene_blocks_generation != scene.generation || cache.scene_blocks_draws != scene_end)) {
+        cache.scene_blocks.clear();
+        for (size_t i = 0; i < scene_end; i += kBlock) {
+            DrawBounds u{ 1e9f, 1e9f, -1e9f, -1e9f };
+            for (size_t k = i; k < std::min(i + kBlock, scene_end); k++) {
+                const DrawBounds &b = scene.bounds[k];
+                u = { std::min(u.x0, b.x0), std::min(u.y0, b.y0), std::max(u.x1, b.x1), std::max(u.y1, b.y1) };
+            }
+            cache.scene_blocks.push_back(u);
+        }
+        cache.scene_blocks_generation = scene.generation;
+        cache.scene_blocks_draws = scene_end;
+    }
+    // The scene's draws below this are passed over: their sixteen can't be kept. (Decided at the sixteen's first
+    // draw and kept across copy_to's runs: the objects' pieces cut the scene's list into hundreds of runs shorter
+    // than sixteen, and by whole sixteens within a run almost none was passed over: the copy still 4.6 ms and
+    // the pick's 2.7 at the diner's far view, the main Vita, 2026-11-18.)
+    size_t skip_end = 0;
+    ObjectDrawCache::CopyCounts counts;
+    static const bool verify = TS_ENV("TS_LEAN_VERIFY") != nullptr;   // debug: what a box passes over, checked draw by draw
+    static unsigned verify_bad = 0;
+    // The scene's list from `from` up to `to`, noting where each storey's floors end in the frame.
+    // The draws' bounds alongside, where asked (the scene's and the objects' worked out before).
     auto copy_to = [&](size_t to) {
-        if (!cull) {
-            for (int l = 0; l < kLotLevels; l++)
-                if (scene.floors_end[l] >= from && scene.floors_end[l] <= to)
-                    scene.frame_floors_end[l] = out.cmds.size() + (scene.floors_end[l] - from);
+        to = std::max(std::min(to, scene_end), from);
+        if (!cull && !areas) {
+            if (for_frame)
+                for (int l = 0; l < kLotLevels; l++)
+                    if (scene.floors_end[l] >= from && scene.floors_end[l] <= to)
+                        scene.frame_floors_end[l] = out.cmds.size() + (scene.floors_end[l] - from);
             out.cmds.insert(out.cmds.end(), scene.list.cmds.begin() + std::ptrdiff_t(from),
                             scene.list.cmds.begin() + std::ptrdiff_t(to));
             if (have_bounds)
@@ -2445,59 +3109,200 @@ void compose_frame(const LotScene &scene, const Lot &lot, const std::vector<LotO
             return;
         }
         for (size_t i = from; i < to; i++) {
-            for (int l = 0; l < kLotLevels; l++)
-                if (scene.floors_end[l] == i)
-                    scene.frame_floors_end[l] = out.cmds.size();
-            if (!near_view(scene.bounds[i]))
+            counts.blocks += i >= skip_end && i % kBlock == 0;
+            if (i >= skip_end && i % kBlock == 0 && !keep(cache.scene_blocks[i / kBlock])) {
+                skip_end = std::min(i + kBlock, scene_end);
+                counts.blocks_passed++;
+                if (verify)
+                    for (size_t k = i; k < skip_end; k++)
+                        if (keep(scene.bounds[k]) && verify_bad++ < 12)
+                            std::printf("lean verify: the scene's draw %lu was passed over with its sixteen\n", (unsigned long)k);
+            }
+            if (i < skip_end) {   // to the sixteen's end, or this run's
+                const size_t stop = std::min(skip_end, to);
+                if (for_frame)   // (the storeys' ends among them: here in the frame)
+                    for (int l = 0; l < kLotLevels; l++)
+                        if (scene.floors_end[l] >= i && scene.floors_end[l] < stop)
+                            scene.frame_floors_end[l] = out.cmds.size();
+                i = stop - 1;
+                continue;
+            }
+            if (for_frame)
+                for (int l = 0; l < kLotLevels; l++)
+                    if (scene.floors_end[l] == i)
+                        scene.frame_floors_end[l] = out.cmds.size();
+            counts.scene_draws++;
+            if (!keep(scene.bounds[i]))
                 continue;
             out.cmds.push_back(scene.list.cmds[i]);
             out_bounds->push_back(scene.bounds[i]);
         }
-        for (int l = 0; l < kLotLevels; l++)
-            if (scene.floors_end[l] == to)
-                scene.frame_floors_end[l] = out.cmds.size();
+        if (for_frame)
+            for (int l = 0; l < kLotLevels; l++)
+                if (scene.floors_end[l] == to)
+                    scene.frame_floors_end[l] = out.cmds.size();
         from = to;
     };
-    for (const Insert &in : inserts) {
-        copy_to(in.at);
+    // One piece: an object's draws (passed over by its box, else draw by draw), or a Sim's mesh.
+    auto piece = [&](const ObjectDrawCache::FrameInsert &in) {
         if (in.cmds) {
-            if (cull && in.bounds && in.bounds->size() == in.cmds->size()) {
+            if (picking && in.boxed && !keep(in.box)) {   // none of its draws can be kept
+                counts.pieces_passed++;
+                if (verify && in.bounds && in.bounds->size() == in.cmds->size())
+                    for (const DrawBounds &b : *in.bounds)
+                        if (keep(b) && verify_bad++ < 12)
+                            std::printf("lean verify: an object's draw (%.0f, %.0f)-(%.0f, %.0f) lies outside its box (%.0f, %.0f)-(%.0f, %.0f)\n",
+                                        b.x0, b.y0, b.x1, b.y1, in.box.x0, in.box.y0, in.box.x1, in.box.y1);
+                return;
+            }
+            if ((cull || areas) && in.bounds && in.bounds->size() == in.cmds->size()) {
+                counts.piece_draws += unsigned(in.cmds->size());
                 for (size_t i = 0; i < in.cmds->size(); i++)
-                    if (near_view((*in.bounds)[i])) {
+                    if (keep((*in.bounds)[i])) {
                         out.cmds.push_back((*in.cmds)[i]);
                         out_bounds->push_back((*in.bounds)[i]);
                     }
             } else {
                 out.cmds.insert(out.cmds.end(), in.cmds->begin(), in.cmds->end());
-                if (have_bounds)
-                    out_bounds->insert(out_bounds->end(), in.bounds->begin(), in.bounds->end());
+                if (have_bounds) {
+                    if (in.bounds && in.bounds->size() == in.cmds->size())
+                        out_bounds->insert(out_bounds->end(), in.bounds->begin(), in.bounds->end());
+                    else
+                        for (const DrawCmd &c : *in.cmds)
+                            out_bounds->push_back(bounds_of(c));
+                }
             }
-            if (in.order == kShadowOrder)   // shadows count with the floors
+            if (for_frame && in.order == kShadowOrder)   // shadows count with the floors
                 for (int l = 0; l < kLotLevels; l++)
                     if (scene.floors_end[l] == in.at)
                         scene.frame_floors_end[l] = out.cmds.size();
-            continue;
+            return;
         }
-        const LiveSim &s = *in.sim;
-        ObjectDrawCache::SimEntry &kept = cache.sims[s.id];   // posed above (or kept from before)
-        const DrawMesh &mesh = *kept.mesh;
-        if (!mesh.tris.empty()) {
-            const DrawCmd &cmd = out.mesh(mesh, s.id);
+        const auto kept = cache.sims.find(in.sim);   // posed in the compose (or kept from before)
+        if (kept == cache.sims.end() || !kept->second.mesh)
+            return;
+        const DrawMesh &mesh = *kept->second.mesh;
+        if (!mesh.tris.empty() && (!areas || meets({ mesh.x0, mesh.y0, mesh.x1, mesh.y1 }))) {
+            const DrawCmd &cmd = out.mesh(mesh, in.sim);
             if (have_bounds)
                 out_bounds->push_back(bounds_of(cmd));
         }
-        if (items)
-            items->push_back({ 0x10000u + s.id, kept.version, mesh.x0, mesh.y0, mesh.x1, mesh.y1 });
+    };
+    if (areas) {
+        // The scene's draws from the index by place: those on the areas' cells, once each, in the list's order,
+        // the pieces put in between as they come. (Walking the list, even by sixteens, tested 2,500-4,000 of the
+        // diner's 5,300 scene draws a frame at the far zoom: 4.3 ms, and 2.7 more for the cursor's pick.)
+        ObjectDrawCache::SceneIndex &ix = cache.scene_index;
+        if (ix.generation != scene.generation || ix.draws != scene_end) {
+            DrawBounds u{ 1e9f, 1e9f, -1e9f, -1e9f };
+            for (const DrawBounds &bd : scene.bounds)
+                u = { std::min(u.x0, bd.x0), std::min(u.y0, bd.y0), std::max(u.x1, bd.x1), std::max(u.y1, bd.y1) };
+            if (scene_end == 0)
+                u = { 0, 0, 1, 1 };
+            ix.cell = std::max({ 64.0f, (u.x1 - u.x0) / 384.0f, (u.y1 - u.y0) / 384.0f });
+            ix.x0 = u.x0, ix.y0 = u.y0;
+            ix.w = int((u.x1 - u.x0) / ix.cell) + 1, ix.h = int((u.y1 - u.y0) / ix.cell) + 1;
+            auto cells_of = [&](const DrawBounds &bd, int &cx0, int &cy0, int &cx1, int &cy1) {
+                cx0 = std::clamp(int((bd.x0 - ix.x0) / ix.cell), 0, ix.w - 1), cx1 = std::clamp(int((bd.x1 - ix.x0) / ix.cell), 0, ix.w - 1);
+                cy0 = std::clamp(int((bd.y0 - ix.y0) / ix.cell), 0, ix.h - 1), cy1 = std::clamp(int((bd.y1 - ix.y0) / ix.cell), 0, ix.h - 1);
+            };
+            ix.start.assign(size_t(ix.w) * size_t(ix.h) + 1, 0);
+            for (size_t i = 0; i < scene_end; i++) {
+                int cx0, cy0, cx1, cy1;
+                cells_of(scene.bounds[i], cx0, cy0, cx1, cy1);
+                for (int cy = cy0; cy <= cy1; cy++)
+                    for (int cx = cx0; cx <= cx1; cx++)
+                        ix.start[size_t(cy) * size_t(ix.w) + size_t(cx) + 1]++;
+            }
+            for (size_t c = 1; c < ix.start.size(); c++)
+                ix.start[c] += ix.start[c - 1];
+            ix.items.assign(ix.start.back(), 0);
+            std::vector<uint32_t> at(ix.start.begin(), ix.start.end() - 1);
+            for (size_t i = 0; i < scene_end; i++) {
+                int cx0, cy0, cx1, cy1;
+                cells_of(scene.bounds[i], cx0, cy0, cx1, cy1);
+                for (int cy = cy0; cy <= cy1; cy++)
+                    for (int cx = cx0; cx <= cx1; cx++)
+                        ix.items[at[size_t(cy) * size_t(ix.w) + size_t(cx)]++] = uint32_t(i);
+            }
+            ix.seen.assign(scene_end, 0);
+            ix.stamp = 0;
+            ix.generation = scene.generation;
+            ix.draws = scene_end;
+        }
+        if (++ix.stamp == 0) {   // (come round: every draw unseen again)
+            std::fill(ix.seen.begin(), ix.seen.end(), 0u);
+            ix.stamp = 1;
+        }
+        std::vector<uint32_t> &cand = ix.candidates;
+        cand.clear();
+        for (const DrawBounds &ar : *areas) {
+            const int cx0 = std::clamp(int((ar.x0 - ix.x0) / ix.cell), 0, ix.w - 1), cx1 = std::clamp(int((ar.x1 - ix.x0) / ix.cell), 0, ix.w - 1);
+            const int cy0 = std::clamp(int((ar.y0 - ix.y0) / ix.cell), 0, ix.h - 1), cy1 = std::clamp(int((ar.y1 - ix.y0) / ix.cell), 0, ix.h - 1);
+            if (ar.x1 < ix.x0 || ar.y1 < ix.y0 || ar.x0 > ix.x0 + float(ix.w) * ix.cell || ar.y0 > ix.y0 + float(ix.h) * ix.cell)
+                continue;   // (off the scene)
+            for (int cy = cy0; cy <= cy1; cy++)
+                for (int cx = cx0; cx <= cx1; cx++) {
+                    const size_t c = size_t(cy) * size_t(ix.w) + size_t(cx);
+                    for (uint32_t k = ix.start[c]; k < ix.start[c + 1]; k++) {
+                        const uint32_t i = ix.items[k];
+                        if (ix.seen[i] == ix.stamp)
+                            continue;
+                        ix.seen[i] = ix.stamp;
+                        if (keep(scene.bounds[i]))
+                            cand.push_back(i);
+                    }
+                }
+        }
+        std::sort(cand.begin(), cand.end());
+        counts.candidates = unsigned(cand.size());
+        size_t ci = 0;
+        bool marked[kLotLevels] = {};
+        // The scene's kept draws below `to`; a storey's floors end in the frame where the copy passes that draw
+        // (after the pieces put in at it, as the walk of the list has it).
+        auto pass = [&](size_t to) {
+            while (ci < cand.size() && cand[ci] < to) {
+                const uint32_t i = cand[ci++];
+                if (for_frame)
+                    for (int l = 0; l < kLotLevels; l++)
+                        if (!marked[l] && scene.floors_end[l] <= i) {
+                            scene.frame_floors_end[l] = out.cmds.size();
+                            marked[l] = true;
+                        }
+                out.cmds.push_back(scene.list.cmds[i]);
+                out_bounds->push_back(scene.bounds[i]);
+            }
+            if (for_frame)
+                for (int l = 0; l < kLotLevels; l++)
+                    if (!marked[l] && scene.floors_end[l] < to) {
+                        scene.frame_floors_end[l] = out.cmds.size();
+                        marked[l] = true;
+                    }
+        };
+        for (const ObjectDrawCache::FrameInsert &in : cache.frame_inserts) {
+            pass(std::min(size_t(in.at), scene_end));
+            piece(in);
+        }
+        pass(scene_end);
+        if (for_frame)
+            for (int l = 0; l < kLotLevels; l++)
+                if (!marked[l])
+                    scene.frame_floors_end[l] = out.cmds.size();
+    } else {
+        for (const ObjectDrawCache::FrameInsert &in : cache.frame_inserts) {
+            copy_to(in.at);
+            piece(in);
+        }
+        copy_to(scene_end);
     }
-    copy_to(scene.list.cmds.size());
-    for (auto it = cache.sims.begin(); it != cache.sims.end();)   // Sims gone or out of view
-        it = it->second.used ? std::next(it) : cache.sims.erase(it);
     if (out_bounds && !have_bounds)   // a scene without them: all now
         for (const DrawCmd &cmd : out.cmds)
             out_bounds->push_back(bounds_of(cmd));
-    g_compose_profile.sims_ms += sims_ms;
-    g_compose_profile.copy_ms += since(t_copy) - sims_ms;
-    g_compose_step = "done";
+    if (for_frame) {
+        counts.kept = unsigned(out.cmds.size());
+        cache.copy_counts = counts;
+        g_compose_profile.copy_ms += std::chrono::duration<double, std::milli>(PClock::now() - t_copy).count();
+    }
 }
 
 Canvas paint_lot(const Lot &lot, Content &content, const PaintOptions &options, PaintStats &stats)
@@ -2523,7 +3328,8 @@ bool lot_ground_box(const Lot &lot, int box[4])
     return box[2] >= box[0] && box[3] >= box[1];
 }
 
-bool make_lot_thumbnail(const Lot &lot, Content &content, LotThumbnail &out)
+// The picture from one canvas of the whole lot (as it was made to 2026-11-16: TS_THUMB_WHOLE=1).
+static bool make_lot_thumbnail_whole(const Lot &lot, Content &content, LotThumbnail &out)
 {
     if (!lot_ground_box(lot, out.box))
         return false;
@@ -2592,6 +3398,138 @@ bool make_lot_thumbnail(const Lot &lot, Content &content, LotThumbnail &out)
             }
     }
     return true;
+}
+
+// The neighbourhood's picture of a lot: the lot drawn at the far zoom, walls up, with the roof and without,
+// and a quarter-size picture kept of each (each 4 x 4 block the mean of its drawn pixels, there where at
+// least half of it is drawn), cropped to what the closed one shows. Drawn 64 rows at a time: the whole
+// lot in one canvas was 6.9-8.4 MB in a single block, asked for at a lot's save with the lot still in
+// memory (the main Vita's soak, 2026-11-16: three times it wasn't there and the reserve was used). The
+// blocks sit on a grid fixed by the anchor, known before anything is drawn, so the strips give the same
+// pixels as the one canvas did.
+bool make_lot_thumbnail(const Lot &lot, Content &content, LotThumbnail &out)
+{
+    static const bool as_before = TS_ENV("TS_THUMB_WHOLE") != nullptr;
+    if (as_before)
+        return make_lot_thumbnail_whole(lot, content, out);
+    if (!lot_ground_box(lot, out.box))
+        return false;
+    PaintOptions options;
+    options.zoom = Zoom::Far;
+    options.rotation = 0;
+    options.walls = WallMode::Up;
+    options.people = false;
+    for (int k = 0; k < 4; k++)
+        options.tile_box[k] = out.box[k];
+    SpriteCache sprites(content);
+    constexpr int kStrip = 64;        // rows drawn at a time (a multiple of 4: whole blocks)
+    int anchor_x = 0, anchor_y = 0;   // in the full-size scene
+    int crop[4] = { 0, 0, 0, 0 };     // the closed picture's opaque bounds, used for both
+    int grid_x = 0, grid_y = 0;       // where the blocks' grid starts (left of and above the scene)
+    Canvas canvas;
+    std::vector<uint32_t> quarter;    // the scene at a quarter size, on the grid
+    for (int pass = 0; pass < 2; pass++) {
+        options.roofs = pass == 0;
+        PaintStats stats;
+        LotScene scene = build_lot_scene(lot, content, sprites, options, stats);
+        const int width = scene.width, height = scene.height;
+        if (pass == 0) {
+            const float fx = float(out.box[2]) + 0.5f, fy = float(out.box[3]) + 0.5f;
+            float sx, sy;
+            scene.projector.box(fx, fy, lot.ground(fx, fy), sx, sy);
+            anchor_x = int(sx + scene.projector.m.cadge_w / 2.0f);
+            anchor_y = int(sy + float(scene.projector.m.baseline));
+            // Whole blocks of four from the anchor, so it lands on a pixel of the small picture.
+            auto grid = [](int anchor) { return ((anchor % 4) + 4) % 4 - 8; };
+            grid_x = grid(anchor_x);
+            grid_y = grid(anchor_y);
+            crop[0] = width, crop[1] = height, crop[2] = -1, crop[3] = -1;
+        }
+        const int qw = (width - grid_x + 3) / 4, qh = (height - grid_y + 3) / 4;
+        quarter.assign(size_t(qw) * size_t(qh), 0u);
+        for (int top = grid_y; top < height; top += kStrip) {
+            canvas.reset(width, kStrip, 0u);   // (transparent: alpha 0 where nothing is drawn)
+            rasterize(scene.list, canvas, 0, -top, false);
+            if (pass == 0)
+                for (int row = 0; row < kStrip; row++) {
+                    const int y = top + row;
+                    if (y < 0 || y >= height)
+                        continue;
+                    const uint32_t *line = &canvas.rgba[size_t(row) * size_t(width)];
+                    for (int x = 0; x < width; x++)
+                        if (line[x] >> 24) {
+                            crop[0] = std::min(crop[0], x), crop[1] = std::min(crop[1], y);
+                            crop[2] = std::max(crop[2], x), crop[3] = std::max(crop[3], y);
+                        }
+                }
+            for (int br = 0; br < kStrip / 4; br++) {
+                const int by = (top - grid_y) / 4 + br;
+                if (by >= qh)
+                    break;
+                for (int bx = 0; bx < qw; bx++) {
+                    uint32_t sum[3] = {}, n = 0;
+                    for (int dy = 0; dy < 4; dy++)
+                        for (int dx = 0; dx < 4; dx++) {
+                            const int x = grid_x + bx * 4 + dx, row = br * 4 + dy, y = top + row;
+                            if (x < 0 || y < 0 || x >= width || y >= height)
+                                continue;
+                            const uint32_t c = canvas.rgba[size_t(row) * size_t(width) + size_t(x)];
+                            if (!(c >> 24))
+                                continue;
+                            for (int k = 0; k < 3; k++)
+                                sum[k] += (c >> (8 * k)) & 0xff;
+                            n++;
+                        }
+                    if (n >= 8)
+                        quarter[size_t(by) * size_t(qw) + size_t(bx)] =
+                            0xff000000u | (sum[2] / n) << 16 | (sum[1] / n) << 8 | (sum[0] / n);
+                }
+            }
+        }
+        if (pass == 0) {
+            if (crop[2] < crop[0])
+                return false;
+            crop[0] = anchor_x - ((anchor_x - crop[0] + 3) / 4) * 4;
+            crop[1] = anchor_y - ((anchor_y - crop[1] + 3) / 4) * 4;
+            out.anchor_x = (anchor_x - crop[0]) / 4;
+            out.anchor_y = (anchor_y - crop[1]) / 4;
+        }
+        const int w = (crop[2] - crop[0]) / 4 + 1, h = (crop[3] - crop[1]) / 4 + 1;
+        const int qx0 = (crop[0] - grid_x) / 4, qy0 = (crop[1] - grid_y) / 4;
+        Image &img = pass == 0 ? out.closed : out.open;
+        img.width = w;
+        img.height = h;
+        img.rgba.assign(size_t(w) * size_t(h), 0u);
+        for (int by = 0; by < h; by++)
+            for (int bx = 0; bx < w; bx++) {
+                const int qx = qx0 + bx, qy = qy0 + by;
+                if (qx >= 0 && qy >= 0 && qx < qw && qy < qh)
+                    img.rgba[size_t(by) * size_t(w) + size_t(bx)] = quarter[size_t(qy) * size_t(qw) + size_t(qx)];
+            }
+    }
+    return true;
+}
+
+bool is_staircase(Content &content, const ObjectInfo &info)
+{
+    static std::mutex lock;
+    static std::unordered_map<uint32_t, bool> known;
+    std::lock_guard<std::mutex> hold(lock);
+    if (auto it = known.find(info.guid); it != known.end())
+        return it->second;
+    bool yes = info.objd.get(Objd::BuildModeType) == 3;
+    const uint16_t master = info.objd.get(Objd::MasterID);
+    if (!yes && master != 0 && info.objd.get(Objd::SubIndex) != 0xffff)
+        for (const auto &entry : content.objects().by_guid) {
+            const ObjectInfo &o = entry.second;
+            if (o.ref.path == info.ref.path && o.ref.offset == info.ref.offset && o.objd.get(Objd::MasterID) == master &&
+                o.objd.get(Objd::SubIndex) == 0xffff) {
+                yes = o.objd.get(Objd::BuildModeType) == 3;
+                break;
+            }
+        }
+    known[info.guid] = yes;
+    return yes;
 }
 
 int catalogue_facing(const ObjectInfo &info)

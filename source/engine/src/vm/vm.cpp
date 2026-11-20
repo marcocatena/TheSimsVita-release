@@ -10,6 +10,7 @@
 #include "core/memory_kind.h"
 #include "core/fast_clock.h"
 #include "vm/vm.h"
+#include "world/create_sim.h"
 #include "files/install.h"
 #include "core/strings.h"
 
@@ -146,8 +147,26 @@ bool Entity::run_entry(Vm &vm, int entry, bool immediately, int16_t stack_id, co
         const bool ok = thread->run_now(std::move(f)) == Exit::ReturnTrue;
         // After a Sim's init: the Legacy's premade Sims set their own 0-10 interests there ("init
         // traits", the Goths'), which the exe deals on 0-1000 as they come onto the lot.
-        if (entry == 0 && person)
+        if (entry == 0 && person) {
+            // The exe copies the neighbour's record in again after the init tree, unless person data 25 is
+            // 1966 (then clears it), and only then deals: so the interests a premade was dealt once (and kept
+            // in its record) stay, where ours dealt afresh on every lot (FUN_005f4ba0, sims.c 389460-389489;
+            // the copy list FUN_005ab3b0). The open items' audit, 2026-11-20. TS_INIT_RECOPY_OLD=1: as before.
+            static const bool recopy_old = TS_ENV("TS_INIT_RECOPY_OLD") != nullptr;
+            if (!recopy_old && vm.hood && person_data.size() > 86) {
+                if (person_data[25] == 1966) {
+                    person_data[25] = 0;
+                } else if (const Neighbor *n = person_data[31] ? vm.hood->by_id(person_data[31]) : nullptr;
+                           n && n->person_data.size() > 86 && (!info || n->guid == info->guid)) {
+                    static const int kCopied[][2] = { { 2, 7 }, { 9, 18 }, { 20, 20 }, { 26, 26 }, { 46, 61 }, { 63, 63 },
+                                                      { 65, 65 }, { 67, 69 }, { 74, 76 }, { 80, 86 } };
+                    for (const auto &span : kCopied)
+                        for (int k = span[0]; k <= span[1]; k++)
+                            person_data[size_t(k)] = n->person_data[size_t(k)];
+                }
+            }
             vm.deal_interests(*this);
+        }
         // Bartender Waylon (Superstar, NPC_RaveWaylon.iff "init tree" ip 6-7) is made a five-star
         // celebrity (person data 80 := 1000, 81 := 10): fans and stars went after him, off his post into
         // Studio Town's streets, with a star over his head (the community's "Bartender Waylon Fix").
@@ -158,6 +177,14 @@ bool Entity::run_entry(Vm &vm, int entry, bool immediately, int16_t stack_id, co
             person_data[80] = 0;
             person_data[81] = 0;
         }
+        // Community fix ("Coffee Table Fixes", r/thesims1): the newspaper (Newspaper.iff, E6B26801) allows the
+        // heights of a floor, a table, a counter and an end table (object data 4: 0x00ad), not a coffee
+        // table's (bit 1, Global BCON 257 key 1), which the tabloid's init does set: the coffee tables'
+        // "Place On Surface - TEST" refuses it, Sims carry the paper past one to the dining table and buy
+        // mode won't put it there. The bit set after its init, as the mod's "init tree" does. TS_PAPER_HEIGHT_OLD=1.
+        static const bool paper_old = TS_ENV("TS_PAPER_HEIGHT_OLD") != nullptr;
+        if (entry == 0 && !person && vm.community_fixes && !paper_old && info && info->guid == 0xE6B26801u)
+            data[4] = int16_t(uint16_t(data[4]) | 0x0002);
         return ok;
     }
     thread->push(std::move(f));
@@ -220,6 +247,7 @@ Exit Thread::run_now(Frame frame, int max_steps, bool keep_temps)
         spare_stacks.pop_back();
     }
     saved.swap(stack);   // (the spare, empty, becomes the stack; the thread's own is kept aside)
+    aside_stacks.push_back(&saved);
     const auto saved_temps = temps;
     const auto saved_xl = temp_xl;
     const Exit saved_exit = last_exit;
@@ -233,6 +261,7 @@ Exit Thread::run_now(Frame frame, int max_steps, bool keep_temps)
         vm_.warn(&stack.back(), "check tree ran too long");
         last_exit = Exit::Error;
     }
+    aside_stacks.pop_back();
     stack.swap(saved);
     saved.clear();
     spare_stacks.push_back(std::move(saved));   // (room kept for the next)
@@ -499,7 +528,16 @@ void Thread::pop(Exit result)
         if (queue[0].mode != QueueMode::ParentIdle)
             entity_.set_flag(FlagInteractionCanceled, false);
         queue.erase(queue.begin());
-        interaction_ended();
+        // A "run immediately" interaction that ran inside another (Vacation's score controller pushes
+        // "Imbed Score" onto the family every six hours, the hotel its warnings) ends without the
+        // interaction's end: the exe's block for it (FUN_005f01f0, sims.c 386127-386151) runs the tree and
+        // puts person data 33 back, and never calls FUN_005f4dc0. Ours ended the one under it too: its
+        // motive changes gone, a shower or hot tub waiting for a need to fill waited for good (Mortimer for
+        // days in a hotel's shower, every need at -100: the Vacation audit, 2026-11-18).
+        // TS_NESTED_END_OLD=1.
+        static const bool nested_old = TS_ENV("TS_NESTED_END_OLD") != nullptr;
+        if (!discard || nested_old || stack.empty() || !entity_.person)
+            interaction_ended();
         if (discard && saved_running >= 0 && entity_.person)
             entity_.person_data[33] = saved_running;   // back to what it was doing
     }
@@ -612,12 +650,36 @@ CodeOwner Vm::owner_of(const ObjectInfo &info)
     return o;
 }
 
+static bool object_file_is(const ObjectInfo &info, const char *file);
+
 const Routine *Vm::routine(const CodeOwner &owner, uint16_t id, CodeOwner *resolved)
 {
     // 256-4095 global.iff, 4096-8191 the object's own file, 8192+ its semi-global.
     const LoadedIff *file = id >= 8192 ? owner.semi : id >= 4096 ? owner.own : global_code.own;
     if (resolved)
         *resolved = owner;   // the caller's resources stay in scope, as in FreeSims
+    // Community fix ("Put Away Pet Awards", r/thesims1): a pet show award's "Put Away" is offered only with
+    // room in a Crake's Cabinet ("Put Away - TEST", PetAwards.iff 4100: its two parts by GUID), though its
+    // "CT - Put Away" (4103) knows the mantelpieces too. The mod's file has Vacation's Souvenirs.iff routines
+    // of the same numbers in their place (row for row): any display cabinet or mantel with room. Those two
+    // run here from Souvenirs.iff, as the award's own (its strings, its other routines); the cabinets'
+    // category in set_to_next_one. TS_PET_AWARDS_OLD=1.
+    static const bool awards_old = TS_ENV("TS_PET_AWARDS_OLD") != nullptr;
+    if (community_fixes && !awards_old && (id == 4100 || id == 4103) && owner.object && object_file_is(*owner.object, "petawards.iff"))
+        if (const FileRef *s = content.file("Souvenirs.iff"))
+            if (const LoadedIff *souvenirs = content.load(*s))
+                if (const IffChunk *c = souvenirs->iff.find("BHAV", id); c && c->label == (id == 4100 ? "Put Away - TEST" : "CT - Put Away"))
+                    file = souvenirs;
+    // "All stereo stations" (Vm::stations_table): a stereo's 4160-4169 are the jukebox's five station
+    // tests and actions, run as the stereo's own.
+    if (all_stations && id >= 4160 && id < 4170 && station_routines_[id - 4160] != 0 && owner.object &&
+        (object_file_is(*owner.object, "stereos.iff") || object_file_is(*owner.object, "dormstereo.iff") ||
+         object_file_is(*owner.object, "stereosuperstar.iff")))
+        if (const FileRef *j = content.file("JukeBox.iff"))
+            if (const LoadedIff *jukebox = content.load(*j)) {
+                file = jukebox;
+                id = station_routines_[id - 4160];
+            }
     if (!file)
         return nullptr;
     auto key = std::make_pair(file, id);
@@ -711,6 +773,15 @@ int16_t Vm::tuning(const Frame &frame, uint16_t which)
     // "Objects.far:MailBox.iff", any case): the owner's file path is the archive's (".../Objects.far"),
     // which the first check looked in, so the option did nothing (the user, 2026-11-14: "every 6 days
     // ... doesn't feel that way"; 5 bills in 16 days either way). Not MailboxVacation.iff.
+    // Community fix ("Item Rating Fixes", r/thesims1): the Crimson Collection Bed (BedMMDownload.iff, $440,
+    // comfort 7 in the catalogue) sleeps on the Midnight Mystery Canopy Bed's constants ($4999, comfort 10):
+    // comfort up to 100 at 56 an hour, energy at 3, the best bed in the game. Its "set motive deltas for
+    // sleep" (4153) reads them as its tuning 4, 8 and 19: answered as the mod's file has them, 40, 30 and 1
+    // (Beds.iff's cheap double's). TS_CRIMSON_BED_OLD=1.
+    static const bool crimson_old = TS_ENV("TS_CRIMSON_BED_OLD") != nullptr;
+    if (community_fixes && !crimson_old && (which == 4 || which == 8 || which == 19) && frame.owner.object &&
+        object_file_is(*frame.owner.object, "bedmmdownload.iff"))
+        return which == 4 ? 40 : which == 8 ? 30 : 1;
     auto is_mailbox = [](const Frame &fr) { return fr.owner.object && object_file_is(*fr.owner.object, "mailbox.iff"); };
     if (TS_ENV("TS_BILLS_LOG") && frame.routine && frame.routine->name == "process")   // debug
         std::printf("bills: tuning %u in \"process\" of %s, mailbox %d, bill_days %d\n", unsigned(which),
@@ -984,7 +1055,28 @@ Entity *Vm::create(const ObjectInfo &info, int tile_x, int tile_y, int level, in
     e->serial = next_serial_++;
     next_id_ = std::max<uint16_t>(next_id_, uint16_t(id + 1));
     e->info = &info;
-    e->code = owner_of(info);
+    // A Magic Town townie made before 2026-11-18 (a neighbourhood made on the Vita: the "Strange" family,
+    // person data 61 = 6000, from the plain person template) runs the code and the entry points of the game's
+    // own template for them, TemplateNPCs/MMClownieGeneric.iff (22320029), whose "init tree" gives one its
+    // wand, skills and job: without, nobody at the duelling arena could be challenged (create_sim.cpp
+    // register_made has the story; those made since are copies of the template). TS_STRANGE_TEMPLATE_OLD=1.
+    // (The other townies made from the plain template likewise, each family by its own: townie_template in
+    // world/create_sim.h. Hot Date's ready-made ones, copies of their own files, are left as they are.)
+    const ObjectInfo *code_info = &info;
+    if (hood && info.label.rfind("made - ", 0) == 0)
+        if (const Neighbor *rec = hood->by_guid(info.guid); rec && rec->person_data.size() > 61)
+            if (const uint32_t guid = townie_template(content, rec->person_data[61], &info.body_strings)) {
+                const ObjectInfo *t = content.object(guid), *plain = content.object(0x7FD96B54u);
+                if (t && plain && info.where == plain->where)
+                    code_info = t;
+            }
+    if (TS_ENV("TS_STRANGE_LOG") && info.objd.get(Objd::ObjectType) == 2) {   // debug: whose code a Sim is made with
+        const Neighbor *rec = hood ? hood->by_guid(info.guid) : nullptr;
+        std::printf("create person %s (%s): record %s, person 61 %d, code of %s\n", info.label.c_str(), info.where.c_str(),
+                    rec ? "found" : "none", rec && rec->person_data.size() > 61 ? int(rec->person_data[61]) : -1,
+                    code_info->where.c_str());
+    }
+    e->code = owner_of(*code_info);
     e->person = info.objd.get(Objd::ObjectType) == 2;
     e->direction = direction & 7;
     if (tile_x >= 0) {
@@ -994,8 +1086,8 @@ Entity *Vm::create(const ObjectInfo &info, int tile_x, int tile_y, int level, in
     }
     e->attributes.assign(info.objd.get(Objd::NumAttributes), 0);
     // Entry points: the OBJf table, or the routines named in the OBJD.
-    if (info.objd.get(Objd::UsesFnTable) && e->code.own) {
-        if (const IffChunk *c = e->code.own->iff.find("OBJf", info.objd_id)) {
+    if (code_info->objd.get(Objd::UsesFnTable) && e->code.own) {
+        if (const IffChunk *c = e->code.own->iff.find("OBJf", code_info->objd_id)) {
             std::string err;
             parse_objf(e->code.own->body(*c), c->size, e->entry_points, err);
         }
@@ -1010,7 +1102,7 @@ Entity *Vm::create(const ObjectInfo &info, int tile_x, int tile_y, int level, in
             Objd::BhavEatSurface, Objd::BhavSit, Objd::BhavStand, Objd::BhavClean, Objd::BhavRepair,
         };
         for (Objd::Field f : kEntries)
-            e->entry_points.push_back({ 0, info.objd.get(f) });
+            e->entry_points.push_back({ 0, code_info->objd.get(f) });
         e->entry_points.resize(33);
     }
     e->set_flag(FlagChairFacing, true);
@@ -1028,6 +1120,9 @@ Entity *Vm::create(const ObjectInfo &info, int tile_x, int tile_y, int level, in
                 e->tree_file = f;
                 break;
             }
+        if (all_stations)   // (a stereo: the jukebox's five stations after its own)
+            if (const Ttab *t = stations_table(*e))
+                e->tree_table = t;
     }
     if (e->person) {
         // A Sim's lasting person data comes from the neighbourhood.
@@ -1035,6 +1130,18 @@ Entity *Vm::create(const ObjectInfo &info, int tile_x, int tile_y, int level, in
             if (const Neighbor *n = hood->by_guid(info.guid)) {
                 std::copy(n->person_data.begin(), n->person_data.end(), e->person_data.begin());
                 e->person_data[31] = n->id;   // NeighborId
+                clear_lot_marks(e->person_data);   // (a record kept from before 2026-11-18: see store_people)
+                // Their inventory too: the exe keeps a Sim's tokens on the neighbour, so whoever is made on a lot
+                // has them. Ours copied them only to the residents of a lot's file, a family moving in and a home
+                // come back to: a Sim made on the lot a trip arrives on (generic call 18, a visitor, a townie) had
+                // none, so the date the cab's script names in a kind 1 token was never looked up there (generic
+                // call 19): "we had dinner at the diner and I selected to go somewhere else with the pay phone,
+                // they followed me in the cab but when we spawned at the new location they didn't show up" (the
+                // user, 2026-11-18); and what the traveller carried wasn't with them, the record's own list
+                // written over with the empty one when the people were next stored. TS_CREATE_TOKENS_OLD=1.
+                static const bool tokens_old = TS_ENV("TS_CREATE_TOKENS_OLD") != nullptr;
+                if (!tokens_old)
+                    e->tokens = n->tokens;
             }
         deal_interests(*e);
         set_body_animations(*e);
@@ -1267,7 +1374,16 @@ void Vm::load_lot()
         const bool same_object = theirs && theirs->where == e->info->where &&
                                  theirs->objd.get(Objd::MasterID) != 0 &&
                                  theirs->objd.get(Objd::MasterID) == e->info->objd.get(Objd::MasterID);
-        const int level = root->level + own_offset - (same_object ? int16_t(theirs->objd.get(Objd::LevelOffset)) : 0);
+        int level = root->level + own_offset - (same_object ? int16_t(theirs->objd.get(Objd::LevelOffset)) : 0);
+        // Sharing an upstairs tile with another object, it is on that storey already: a staircase's top
+        // landing and stubs (offset 1 from the stair's foot) under the ceiling lamps, a wall lamp and a
+        // window of lot 28's upper floor came out a storey above the house and weren't made, both
+        // staircases without their top: a Sim sent up played the way down at the foot, round and round
+        // ("going down the stairs but not on the stairs and was stuck in a loop", the user, 2026-11-18).
+        // TS_SHARED_TILE_LEVEL_OLD=1.
+        static const bool shared_old = TS_ENV("TS_SHARED_TILE_LEVEL_OLD") != nullptr;
+        if (!shared_old && !same_object && level >= kLotLevels)
+            level = root->level;
         if (TS_ENV("TS_PLACEDBG"))   // debug: objects placed by the one whose tile they share
             std::printf("placed #%d %s by #%d %s at (%d, %d) level %d: own offset %d, theirs %d -> level %d\n", int(o.id),
                         e->info->label.c_str(), int(root->id), theirs ? theirs->label.c_str() : "?", root->x, root->y,
@@ -1502,7 +1618,50 @@ void Vm::store_people()
         for (int k : { 0, 27, 32, 33, 34, 35, 37 })
             if (size_t(k) < n->person_data.size())
                 n->person_data[size_t(k)] = 0;
+        clear_lot_marks(n->person_data);
     }
+    // The family's phone and baby flags, from the home lot's objects' category (object data 59: 1 a phone, 9 a baby).
+    if (Family *fam = hood->family_in_house(house); fam && !TS_ENV("TS_FAMILY_FLAGS_OLD")) {
+        int flags = fam->flags & ~3;
+        for (const auto &e : entities)
+            if (!e->dead && !e->person && e->in_world()) {
+                const int16_t category = e->data[59];
+                flags |= category == 1 ? 1 : category == 9 ? 2 : 0;
+            }
+        fam->flags = flags;
+    }
+    // Makin' Magic: what the family has made, from the home lot's spell controller onto the family's
+    // record (the exe at a save of the family, sims.c 291813-291845: each of its six never lowered).
+    if (Family *fam = hood->family_in_house(house))
+        for (const auto &e : entities)
+            if (!e->dead && e->info && e->info->guid == kSpellController) {
+                for (int i = 0; i < 6; i++)
+                    fam->spells[i] = std::max(fam->spells[i], e->attribute(i));
+                break;
+            }
+}
+
+// Person data 59, when above 0, is the number of an object on this lot: what the Sim is taken up with (a
+// restaurant's "Eat" and "Eat with" set it to the table's controller and clear it as the meal ends; the bar,
+// the hot tub, table football, a sofa's seat with flag 1 of 79 the same way), and the game's "get interaction
+// eligibility" (PersonGlobals 8277, the first test of every social and greeting) refuses anyone whose 59 isn't
+// 0. It went into the neighbourhood's record with the rest whenever the people were stored (a trip setting off,
+// a save) while a Sim was in the middle of one, and came out again on the next lot, where the number is nobody's:
+// that Sim then had nothing on their menu for the player's Sim, not even a greeting, and no Sim could start a
+// social with them, until they next ate a whole meal; and each visit left more of them so. The user, at the
+// diner, 2026-11-17: "Betty is stood there with nothing I can interact with, I can't even greet her", "now Elden
+// is froze like Betty": the neighbourhood's save of that night has Betty's 59 at 869 and Elden's at 789, with
+// six others; the next morning's, thirteen. So: not kept in the record, and taken off a record or a Sim made
+// from one (a negative 59 is a state of the Sim's own, "not to be approached": kept).
+// TS_KEEP_LOT_MARKS=1: as before. (What the exe writes into its neighbour records wasn't read.)
+void clear_lot_marks(std::vector<int16_t> &person_data)
+{
+    static const bool keep = TS_ENV("TS_KEEP_LOT_MARKS") != nullptr;
+    if (keep || person_data.size() <= 79)
+        return;
+    if (person_data[59] > 0)
+        person_data[59] = 0;
+    person_data[79] = int16_t(person_data[79] & ~1);   // (the sofa's "seated here" mark, set with 59)
 }
 
 void Vm::deal_interests(Entity &e)
@@ -1646,13 +1805,59 @@ int Vm::remove_visiting_families()
     return gone;
 }
 
+int Vm::remove_family_clones()
+{
+    const Family *fam = hood ? hood->family_in_house(house) : nullptr;
+    if (!fam || house == 0)
+        return 0;
+    int gone = 0;
+    for (uint32_t guid : fam->members) {
+        std::vector<Entity *> same;
+        for (auto &e : entities)
+            if (e->person && !e->dead && e->info && e->info->guid == guid)
+                same.push_back(e.get());
+        if (same.size() < 2)
+            continue;
+        Entity *keep = same.front();
+        for (Entity *e : same)
+            if (e->id == selected_id)
+                keep = e;
+        for (Entity *e : same) {
+            if (e == keep)
+                continue;
+            std::printf("family: a second %s (#%d) on the lot, made by a move in's fault: removed (#%d stays)\n",
+                        e->info->label.c_str(), int(e->id), int(keep->id));
+            const int16_t id = int16_t(e->id);
+            e->leave_container();
+            for (Entity *s : e->slots)   // (as remove_visiting_families: what they held is let go, their code stops)
+                if (s)
+                    s->leave_container();
+            e->set_position(-1, -1, e->level);
+            e->dead = true;
+            if (e->thread)
+                e->thread->stack.clear();
+            for (auto &o : entities) {   // what the others had queued on them
+                if (o->dead || !o->person || !o->thread)
+                    continue;
+                auto &queue = o->thread->queue;
+                const size_t keep_first = o->thread->in_interaction() ? 1 : 0;
+                for (size_t i = queue.size(); i-- > keep_first;)
+                    if (queue[i].callee == id || queue[i].stack_id == id)
+                        queue.erase(queue.begin() + std::ptrdiff_t(i));
+            }
+            gone++;
+        }
+    }
+    return gone;
+}
+
 // A family's home opened with members of theirs missing altogether (no Sim of that guid on the
 // lot, in the world or out of it): they're built again from the neighbourhood's records and set
 // down by the pedestrian portal nearest the lot's middle, as a trip's arrivals are. The Bobs
 // (2026-11-02): a cancelled travel chooser sent them to a lot that doesn't exist, so they were
 // taken off their lot and never put down anywhere; the home save had the house without them.
 // Not while they're away on a trip to a real lot (they come back with it).
-int Vm::restore_missing_family()
+int Vm::restore_missing_family(const Entity *beside)
 {
     const Family *fam = hood ? hood->family_in_house(house) : nullptr;
     if (!fam || house == 0)
@@ -1660,6 +1865,8 @@ int Vm::restore_missing_family()
     if (hood->travel.family == fam->id && hood->travel.to_house != house && hood->travel.to_house > 0 &&
         hood->houses.count(hood->travel.to_house))
         return 0;   // away for real
+    if (hood->vacations.count(fam->id))
+        return 0;   // left on vacation
     std::vector<uint32_t> missing;
     for (uint32_t guid : fam->members) {
         bool here = false;
@@ -1702,14 +1909,78 @@ int Vm::restore_missing_family()
         sim->run_entry(*this, 0, true);   // init: their person data from the neighbourhood's record
         if (sim->person_data.size() > 61 && sim->person_data[61] == 0)
             sim->person_data[61] = fam->id;
+        if (beside && beside->in_world()) {   // (generic call 32: by the Sim who brought them home)
+            sim->set_position(beside->x16, beside->y16, beside->level);
+            std::printf("family: %s joins the family at home, beside %s\n", info->label.c_str(),
+                        beside->info ? beside->info->label.c_str() : "?");
+            made++;
+            continue;
+        }
         const int16_t x = door ? door->x16 : int16_t(lot.size * 8), y = door ? door->y16 : int16_t(lot.size * 8);
         sim->set_position(x, y, 1);
         std::printf("family: %s was missing from their home and is back at the door\n", info->label.c_str());
         made++;
     }
-    if (made && hood->travel.family == fam->id)
+    if (made && !beside && hood->travel.family == fam->id)
         hood->travel = Travel();   // (the trip that lost them is over)
     return made;
+}
+
+// A Sim of the family living here who is out of the world, in nothing, and running no interaction
+// has nothing left to bring them back: whatever took them out ended without putting them down (the
+// cab's script coming home, "Interaction - Go Downtown" and its like, ends false with the Sim still
+// out if it finds no place for the cab: a player's "whenever I travel and come back, my Sim turns
+// invisible and stops responding ... I had to wait for them to die", Reddit, 2026-11-17, on v1.1;
+// not reproduced, the cause unknown). They idle there for good, their needs falling, and no order
+// reaches them (run_vm `strand <sim> at <tick>`: five game hours, never back). A Sim away for a
+// reason is inside the interaction that keeps them away (At Work, At School, a trip's), so this
+// counts only the time out with none running: after 20 game minutes of it (looked at once a game
+// minute; a few ticks between two interactions never add up to that) they are set down at the way
+// in from the street, as a trip cut short sets its travellers down (end_trip_here), and decay again
+// (person data 29, which a trip sets). People only, on the lot their family lives on.
+// TS_NO_STRAND_RESCUE=1: left as they are.
+int Vm::rescue_stranded()
+{
+    static const bool off = TS_ENV("TS_NO_STRAND_RESCUE") != nullptr;
+    const Family *fam = hood && house != 0 ? hood->family_in_house(house) : nullptr;
+    if (off || !fam)
+        return 0;
+    constexpr int kStep = 30, kLimit = 600;   // ticks: a game minute, twenty
+    int rescued = 0;
+    for (auto &e : entities) {
+        if (!e->person || e->dead || !e->info || !e->thread)
+            continue;
+        if (e->in_world() || e->container) {
+            e->stranded_ticks = 0;
+            continue;
+        }
+        if (e->thread->in_interaction() || pet_kind(*e) ||
+            std::find(fam->members.begin(), fam->members.end(), e->info->guid) == fam->members.end())
+            continue;
+        e->stranded_ticks = uint16_t(e->stranded_ticks + kStep);
+        if (e->stranded_ticks < kLimit)
+            continue;
+        const Entity *door = nullptr;
+        int best = 1 << 30;
+        for (auto &o : entities)
+            if (o->info && o->info->label == "Portal - Pedestrian" && on_lot(*o)) {
+                const int d = std::abs(o->tile_x() - lot.size / 2) + std::abs(o->tile_y() - lot.size / 2);
+                if (d < best) {
+                    best = d;
+                    door = o.get();
+                }
+            }
+        const int16_t x = door ? door->x16 : int16_t(lot.size * 8), y = door ? door->y16 : int16_t(lot.size * 8);
+        e->route = {};
+        e->set_position(x, y, 1);
+        if (e->person_data.size() > 29)
+            e->person_data[29] = 0;
+        e->stranded_ticks = 0;
+        std::printf("family: %s was out of the world with nothing running for 20 game minutes: set down at the street (tick %u)\n",
+                    e->info->label.c_str(), unsigned(ticks));
+        rescued++;
+    }
+    return rescued;
 }
 
 // Global 9, the number of the family on the lot, as the exe sets it at every lot load (sims.c
@@ -1773,6 +2044,16 @@ void Vm::move_in(int16_t family_id)
         const Neighbor *n = hood->by_guid(guid);
         if (!info || !n)
             continue;
+        bool here = false;   // (already on the lot, whatever put them there: never a second of them)
+        for (const auto &e : entities)
+            if (e->person && !e->dead && e->info && e->info->guid == guid) {
+                here = true;
+                break;
+            }
+        if (here && !TS_ENV("TS_MOVE_IN_AGAIN")) {   // (TS_MOVE_IN_AGAIN=1: made again, as before: the repair's test)
+            std::printf("family: %s is on the lot already: not made again by the move in\n", info->label.c_str());
+            continue;
+        }
         const int k = int(made.size());
         const int x = std::clamp(tx + sx * (k % 2), 0, lot.size - 1), y = std::clamp(ty + sy * (k / 2), 0, lot.size - 1);
         Entity *e = create(*info, x, y, 0, 4);
@@ -1807,9 +2088,22 @@ void Vm::refresh_people()
         const Neighbor *n = hood->by_id(e->person_data[31]);
         if (!n || (e->info && n->guid != e->info->guid))
             continue;
+        // (59 and flag 1 of 79 are this lot's own, never the record's: clear_lot_marks. A Sim left at home on a
+        // sofa keeps theirs.)
+        const int16_t taken_with = e->person_data.size() > 79 ? e->person_data[59] : 0;
+        const int16_t seat_mark = e->person_data.size() > 79 ? int16_t(e->person_data[79] & 1) : 0;
+        // (36, the autonomy level, is the init tree's too: the shipped records of the Pleasants, the Roomies
+        // and Michael Bachelor hold 0, and a family moved in from the bin did nothing of its own until the lot
+        // was next loaded: the 2026-11-20 audit, three days standing "until they drop". TS_AUTONOMY_RECORD=1:
+        // the record's, as before.)
+        static const bool autonomy_record = TS_ENV("TS_AUTONOMY_RECORD") != nullptr;
         for (size_t k = 0; k < n->person_data.size() && k < e->person_data.size(); k++)
-            if (k != 0 && k != 27 && k != 31 && k != 32 && k != 33 && k != 34 && k != 35 && k != 37)
+            if (k != 0 && k != 27 && k != 31 && k != 32 && k != 33 && k != 34 && k != 35 && k != 37 && (k != 36 || autonomy_record))
                 e->person_data[k] = n->person_data[k];
+        if (e->person_data.size() > 79 && !TS_ENV("TS_KEEP_LOT_MARKS")) {
+            e->person_data[59] = taken_with;
+            e->person_data[79] = int16_t((e->person_data[79] & ~1) | seat_mark);
+        }
         if (e->tokens.empty())
             e->tokens = n->tokens;
         deal_interests(*e);
@@ -2077,6 +2371,8 @@ void Vm::tick_stopped(int mode)
 void Vm::tick()
 {
     MemScope scope(MemKind::Game);   // (the game's own allocations counted as such on the Vita: core/memory_kind.h)
+    if (all_stations != stations_applied_)   // (the "All stereo stations" switch turned: the stereos' tables)
+        apply_stations();
     if (ticks % 300 == 0)   // (cheap: one lookup an object; logs only what's wrong)
         check_object_order("tick");
     if (!animations_ahead.empty())   // (the read-ahead's next stage asked for as the first arrives)
@@ -2101,6 +2397,8 @@ void Vm::tick()
                     if (e->route.state == Entity::Route::Walking)
                         layout_b[5]++;
                 }
+    if (ticks % 30 == 0)   // (once a game minute: a Sim left out of the world with nothing to bring them back)
+        rescue_stranded();
     if (const char *w = TS_ENV("TS_WATCH_OBJ")) {   // debug: an object's place and holder as they change
         static int16_t lx = -2, ly = -2;
         static int lc = -2, ld = -2, lf = -2;
@@ -2477,6 +2775,25 @@ int Vm::fixed_answer(const Routine &r, const CodeOwner &owner, const Frame &call
     if (!critters && owner.object && (r.name == "create raccoon" || r.name == "create skunk") &&
         object_file_is(*owner.object, "npc_unleashed_controller.iff"))
         return 0;
+    // "Kids make quick meals" (Gameplay modifiers, the user's 2026-11-18, after the community's "Kids
+    // Prepare Quick Meals" mod; not the original's): two calls of "Am I a Child?" (global 363) keep a child
+    // from a fridge's "Have Lite Meal" (Fridges, Fridges2, FridgesSpellbound.iff 4114 ip 0) and from
+    // cooking (Food.iff "cook food" 4187 ip 1); the mod sends both ways on as for an adult. Answered
+    // "not a child" there. (What a child may cook at: passes_entry_check.)
+    if (kids_quick_meals && r.id == 363 && caller.routine && caller.owner.object &&
+        ((caller.ip == 0 && caller.routine->id == 4114 && caller.routine->name == "Have Lite MEal TEST" &&
+          (object_file_is(*caller.owner.object, "fridges.iff") || object_file_is(*caller.owner.object, "fridges2.iff") ||
+           object_file_is(*caller.owner.object, "fridgesspellbound.iff"))) ||
+         (caller.ip == 1 && caller.routine->id == 4187 && caller.routine->name == "cook food" &&
+          object_file_is(*caller.owner.object, "food.iff"))))
+        return 0;
+    // "Dart board at home" (Gameplay modifiers, the user's 2026-11-18; not the original's): the Triple Bull
+    // Dartboard (dart_board.iff) takes itself off any lot but the kinds its flags name ("load tree": global
+    // 452, "Allow in Locations only", whose home branch is Remove Object Instance). Bought for a home (the
+    // viewer's catalogue), it stays: that call answered true.
+    if (dart_board_home && r.id == 452 && caller.routine && caller.routine->name == "load tree" && caller.owner.object &&
+        object_file_is(*caller.owner.object, "dart_board.iff"))
+        return 1;
     if (!community_fixes)
         return -1;
     auto in = [](const CodeOwner &o, const char *file) {

@@ -221,14 +221,98 @@ std::vector<std::pair<std::string, std::string>> pet_coats(const Content &conten
     return out;
 }
 
+// (The files spell their suits "B401FAfit_...", a made Sim's are lower case.)
+static std::string lower_key(std::string s)
+{
+    for (char &c : s)
+        c = char(std::tolower(uint8_t(c)));
+    return s;
+}
+
+uint32_t townie_template(Content &content, int family, const std::vector<std::string> *body)
+{
+    static const bool strange_old = std::getenv("TS_STRANGE_TEMPLATE_OLD") != nullptr;
+    static const bool townie_old = std::getenv("TS_TOWNIE_TEMPLATE_OLD") != nullptr;
+    static const bool kinds_old = std::getenv("TS_TOWNIE_KINDS_OLD") != nullptr;
+    constexpr uint32_t kHotDate = 0x4FD5DD92u, kCelebrity = 0x6BD3636Au, kStrange = 0x22320029u;
+    uint32_t guid = 0;
+    if (family == 6000)
+        guid = strange_old ? 0u : kStrange;
+    else if (townie_old)
+        guid = 0;
+    else if (family == 5000)
+        guid = kCelebrity;
+    else if (family == 5500 || (family >= 3000 && family <= 3009))
+        guid = kHotDate;
+    else if (family == 2000) {
+        guid = kHotDate;
+        // A ready-made townie: the kind's file whose bodystring has this body and head (entries 1 and 2).
+        static std::mutex lock;
+        static std::map<std::string, uint32_t> kinds;
+        static bool listed = false;
+        if (!kinds_old && body && body->size() > 2) {
+            std::lock_guard<std::mutex> hold(lock);
+            if (!listed) {
+                listed = true;
+                std::vector<std::pair<uint32_t, std::string>> files;   // (listed first: loading a file may add to the index)
+                for (const auto &[g, o] : content.objects().by_guid) {
+                    std::string w = o.where;
+                    for (char &c : w)
+                        c = char(std::tolower(uint8_t(c)));
+                    const size_t at = w.find("templatenpcs/hdt_");
+                    if (at != std::string::npos && w.find("generic") == std::string::npos)
+                        files.emplace_back(g, w.substr(at + 13));
+                }
+                for (const auto &[g, name] : files) {
+                    const FileRef *ref = content.file(name);
+                    const LoadedIff *iff = ref ? content.load(*ref) : nullptr;
+                    const IffChunk *c = iff ? iff->iff.find("STR#", 200) : nullptr;
+                    StringTable t;
+                    std::string err;
+                    if (!c || !parse_str(iff->body(*c), c->size, t, err))
+                        continue;
+                    const std::string *b = t.get(1), *h = t.get(2);
+                    if (b && h && !b->empty() && !h->empty())
+                        kinds[lower_key(*b + "|" + *h)] = g;
+                }
+            }
+            if (auto it = kinds.find(lower_key((*body)[1] + "|" + (*body)[2])); it != kinds.end())
+                guid = it->second;
+            if (std::getenv("TS_STRANGE_LOG"))   // debug
+                std::printf("townie look %s | %s: %s (%lu kinds listed%s%s)\n", (*body)[1].c_str(), (*body)[2].c_str(),
+                            guid == kHotDate ? "no kind's" : "a kind's", (unsigned long)kinds.size(), kinds.empty() ? "" : ", e.g. ",
+                            kinds.empty() ? "" : kinds.begin()->first.c_str());
+        }
+    }
+    return guid && content.object(guid) ? guid : 0u;
+}
+
 const ObjectInfo *register_made(Content &content, Neighborhood *hood, const MadeSim &m)
 {
     if (const ObjectInfo *known = content.object(m.guid))
         return known;
-    const ObjectInfo *base = content.object(m.template_guid ? m.template_guid : kTemplatePerson);
+    // Makin' Magic's townies (the "Strange" family, person data 61 = 6000) are copies of the game's own
+    // template for them, TemplateNPCs/MMClownieGeneric.iff (22320029), in the original: all 240 of the eight
+    // first-run neighbourhoods' are (private/fresh_userdata: its seven routines, "Pick a Job" and "init
+    // skills" among them). Its "init tree" gives one its wand when it has none (Token Operations on "Your
+    // Magic Wand", 1FEC6005), its skills and its job. Ours made them from the plain person template, so in
+    // a neighbourhood made on the Vita no Magic Town townie ever held a wand, and the duelling arena, which
+    // offers the adults there who have one, offered nobody ("Interaction - Duel - TEST" false: found by the
+    // duel run on the Vita, 2026-11-18; the stock neighbourhood's townies, the original's, duel). Taken
+    // from the game's template, those made before too. TS_STRANGE_TEMPLATE_OLD=1: the plain template.
+    // (And the other townies likewise, each family from its own template: townie_template.)
+    uint32_t tmpl = m.template_guid;
+    const uint32_t townie = !tmpl && m.person_data.size() > 61 ? townie_template(content, m.person_data[61], &m.body) : 0u;
+    if (townie)
+        tmpl = townie;
+    const ObjectInfo *base = content.object(tmpl ? tmpl : kTemplatePerson);
     if (!base)
         return nullptr;
     ObjectInfo info = *base;
+    // (The game's template is not a person by its own type: the Sim copied from it is, as the original's
+    // copies are. Left as the template's, the townie was made as a thing, not a Sim.)
+    if (townie && info.objd.fields.size() > Objd::ObjectType)
+        info.objd.fields[Objd::ObjectType] = 2;
     info.guid = m.guid;
     if (info.objd.fields.size() > Objd::GUID2) {
         info.objd.fields[Objd::GUID1] = uint16_t(m.guid & 0xffff);

@@ -110,8 +110,8 @@ Exit random_number(Frame &f, const uint8_t *op)
 {
     const uint16_t range = uint16_t(get(f, u16(op, 6), s16(op, 4)));
     Vm &vm = f.vm();
-    vm.random_state = vm.random_state * 1103515245u + 12345u;
-    const int16_t r = range ? int16_t((vm.random_state >> 8) % range) : 0;
+    const uint32_t drawn = vm.draw();
+    const int16_t r = range ? int16_t(drawn % range) : 0;
     if (const char *log = TS_ENV("TS_RANDOM_LOG"); log && f.routine && f.routine->name.find(log) != std::string::npos)   // debug: a routine's draws
         std::printf("random: day %d %02d:%02d %s of #%d (stack object #%d): %d of %u\n", vm.clock.day, vm.clock.hours, vm.clock.minutes,
                     f.routine->name.c_str(), f.caller ? int(f.caller->id) : 0, int(f.stack_id), int(r), unsigned(range));
@@ -125,11 +125,21 @@ Exit test_object_type(Frame &f, const uint8_t *op)
     Entity *e = f.vm().entity(get(f, op[6], s16(op, 4)));
     if (!e)
         return Exit::Error;
-    if (e->info && e->info->guid == guid)
-        return Exit::GotoTrue;
-    if (e->master && e->master->guid == guid)   // a part of a multi-tile object is its master too
-        return Exit::GotoTrue;
-    return Exit::GotoFalse;
+    bool is = (e->info && e->info->guid == guid) || (e->master && e->master->guid == guid);   // (a part is its master too)
+    // Community fix ("Item Rating Fixes", r/thesims1): ToiletsDeluxe.iff's "Use - set motive deltas" (4116)
+    // asks whether the toilet is the Commoda Cloacina (582F5936, $633) and gives it the plain deltas, the
+    // ExcreSys "Ejectament" ($259) the rich ones with comfort: the wrong way round. That one answer turned.
+    // TS_DELUXE_TOILETS_OLD=1.
+    static const bool toilets_old = TS_ENV("TS_DELUXE_TOILETS_OLD") != nullptr;
+    if (guid == 0x582F5936u && f.vm().community_fixes && !toilets_old && f.routine && f.routine->id == 4116 &&
+        f.routine->name == "Use - set motive deltas" && f.owner.object) {
+        std::string where = f.owner.object->where;
+        for (char &c : where)
+            c = char(std::tolower(uint8_t(c)));
+        if (where.find("toiletsdeluxe.iff") != std::string::npos)
+            is = !is;
+    }
+    return is ? Exit::GotoTrue : Exit::GotoFalse;
 }
 
 Exit set_to_next_one(Frame &f, const uint8_t *op)
@@ -297,7 +307,20 @@ Exit set_to_next_one(Frame &f, const uint8_t *op)
     // The next one up by id: the first match found going up the ids (by_id_), from the people's
     // own list for "next person". (The whole list scanned for every step of every check tree's
     // loop was a third of a choice's time.)
+    // Community fix ("Put Away Pet Awards", Vm::routine): the souvenirs' routines an award runs ask for the
+    // souvenir cabinets' category (36, Global BCON 262 #35); Crake's Cabinet for Awards has its own (70, #69),
+    // which the mod's file changes to 36. Here an award asking for 36 finds both, the cabinets as they were.
+    bool award_asks = false;
+    if (type == 6 && f.vm().community_fixes && !f.args.empty() && f.args[0] == 36 && f.owner.object &&
+        !TS_ENV("TS_PET_AWARDS_OLD")) {
+        std::string where = f.owner.object->where;
+        for (char &c : where)
+            c = char(std::tolower(uint8_t(c)));
+        award_asks = where.find("petawards.iff") != std::string::npos;
+    }
     auto matches = [&](const Entity *e) {
+        if (award_asks && e->value(VarCategory) == 70)
+            return true;
         switch (type) {
         case 1: return e->person;
         case 2: return !e->person;
@@ -337,6 +360,38 @@ Exit set_to_next_one(Frame &f, const uint8_t *op)
             if (!cur || !matches(cur))
                 return Exit::GotoFalse;
             after = cur->seq;
+        }
+        // Community fix (ours, the user's 2026-11-18: "there are 2 serving stations and one just has a waiter
+        // standing waiting for sims, yet they all pick the one where there is no one there ... I would think
+        // they'd utilise the other waiter"): a walker sent in to eat ("Restuarant - Eat", PedMarkers.iff 4113)
+        // takes the first podium of its kind on the lot, every time (the exe's Set to Next from 0 gives the
+        // first of a type, FUN_0061c000), so a restaurant with two podiums seats everyone from one, its
+        // waiter doing all the rounds while the other's stands. With the fixes on, the podium with the fewest
+        // parties (the restaurant controllers, 92534734, naming it in their attribute 10), the first among
+        // equals. TS_PODIUM_SPREAD_OLD=1.
+        static const bool podium_old = TS_ENV("TS_PODIUM_SPREAD_OLD") != nullptr;
+        if (current == 0 && vm.community_fixes && !podium_old && f.routine && f.routine->id == 4113 &&
+            f.routine->name == "Restuarant - Eat") {
+            Entity *best = nullptr;
+            int fewest = 0;
+            for (const auto &up : vm.entities) {
+                if (up->dead || !matches(up.get()))
+                    continue;
+                int parties = 0;
+                for (const auto &c : vm.entities)
+                    if (!c->dead && c->info && c->info->guid == 0x92534734u && c->attributes.size() > 10 &&
+                        c->attributes[10] == up->id)
+                        parties++;
+                if (!best || parties < fewest) {
+                    best = up.get();
+                    fewest = parties;
+                }
+            }
+            if (best) {
+                if (TS_ENV("TS_PODIUM_LOG"))   // debug
+                    std::printf("tick %u: a walker to eat takes podium #%d (%d parties there)\n", unsigned(vm.ticks), int(best->id), fewest);
+                return choose(best);
+            }
         }
         // (vm.entities is in creation order: appended, and erased in place.)
         auto from = std::upper_bound(vm.entities.begin(), vm.entities.end(), after,
@@ -516,6 +571,19 @@ Exit breakpoint(Frame &f, const uint8_t *op)
         return Exit::GotoTrue;
     // The release game carries on past one (FreeSO VMBreakPoint: true); ending the interaction
     // with an error left theatre seats, recliners and the butler call broken (the sweep).
+    // One whose true branch is itself is a dead end by design (PondDuck 4100 "Sub - Setup for Move" lines
+    // 19, 24 and 32, reached when the snap back to its tile fails): the game spins there to its "Too many
+    // iterations" and resets the object in the same tick. Ours spread that spin over 160 ticks of 20,000
+    // instructions each (lot 44, the 2026-11-18 audit: 3.2 million "breakpoint reached" in two days), so
+    // the reset is made at once. TS_BREAKPOINT_SPIN=1: as before.
+    static const bool spin = std::getenv("TS_BREAKPOINT_SPIN") != nullptr;
+    if (!spin && f.instruction().true_pointer == f.ip) {
+        f.vm().warn(&f, "breakpoint reached: a dead end (the object is reset)");
+        if (f.thread) {
+            f.thread->resting = 300;   // (as the run loop's own stop for a thread that never yields)
+            return Exit::Interrupt;    // (the stack cleared by the thread)
+        }
+    }
     f.vm().warn(&f, "breakpoint reached");
     return Exit::GotoTrue;
 }

@@ -30,6 +30,7 @@ namespace ts {
 
 namespace {
 std::atomic<uint64_t> g_pose_us[7];
+std::atomic<uint64_t> g_copy_us[4];
 std::atomic<uint64_t> g_pose_count{ 0 }, g_pose_triangles{ 0 };
 inline uint64_t pose_us(FastClock::time_point from)
 {
@@ -37,11 +38,15 @@ inline uint64_t pose_us(FastClock::time_point from)
 }
 } // namespace
 
+bool g_pose_neon = TS_ENV("TS_POSE_NEON_OFF") == nullptr;
+
 PoseProfile take_pose_profile()
 {
     PoseProfile p;
     for (int i = 0; i < 7; i++)
         p.us[i] = g_pose_us[i].exchange(0);
+    for (int i = 0; i < 4; i++)
+        p.copy_us[i] = g_copy_us[i].exchange(0);
     p.poses = g_pose_count.exchange(0);
     p.triangles = g_pose_triangles.exchange(0);
     return p;
@@ -669,7 +674,87 @@ bool draw_sim_turned(DrawList *out, DrawMesh *mesh_out, const Projector &p, Char
         sy.resize(vc);
         depth.resize(vc);
         tint.resize(vc);
-        for (size_t v = 0; v < vc; v++) {
+        size_t v0 = 0;
+#if defined(__ARM_NEON)
+        // On the Vita four vertices at a time (NEON), the same steps in the same order, but for two: the model's
+        // units over 3 by multiplying by a third, and the normal's length by NEON's reciprocal square root taken
+        // twice nearer (the vector unit divides by neither). Both to about the last bit of a float: a vertex moves
+        // ~0.00001 of a pixel, a tint now and then one step of 255. This part was 0.65-0.8 ms of a ~2.3 ms pose
+        // (2026-11-17). Not with a tilt (the portraits) or the old light. TS_POSE_NEON_OFF=1 (the remote's
+        // "poseneon 0"): one at a time, as before (and as the PC always does).
+        if (g_pose_neon && pitch == 0 && !old_light) {
+            static const float cos30 = std::cos(3.14159265f / 6);
+            const float third = 1.0f / kUnitsPerTile;
+            const float32x4_t vx = vdupq_n_f32(x), vy = vdupq_n_f32(y), vz = vdupq_n_f32(z);
+            const float32x4_t vc4 = vdupq_n_f32(c), vs4 = vdupq_n_f32(s), v3 = vdupq_n_f32(third);
+            const float32x4_t hw = vdupq_n_f32(p.m.half_w), hh = vdupq_n_f32(p.m.half_h);
+            const float32x4_t up = vdupq_n_f32(p.m.one_unit), c30 = vdupq_n_f32(cos30);
+            const float32x4_t offx0 = vdupq_n_f32(p.off_x), offy0 = vdupq_n_f32(p.off_y);
+            const float32x4_t cadge = vdupq_n_f32(float(p.m.cadge_w) / 2.0f), base = vdupq_n_f32(float(p.m.baseline));
+            const float32x4_t kdiag = vdupq_n_f32(Projector::kDepthPerDiagonal), kheight = vdupq_n_f32(Projector::kDepthPerHeight);
+            const float32x4_t lx4 = vdupq_n_f32(light.x), ly4 = vdupq_n_f32(light.y), lz4 = vdupq_n_f32(light.z);
+            const float32x4_t lev = vdupq_n_f32(level), zero = vdupq_n_f32(0.0f), one = vdupq_n_f32(1.0f);
+            const float32x4_t g251 = vdupq_n_f32(251.0f / 255.0f), b209 = vdupq_n_f32(209.0f / 255.0f), half = vdupq_n_f32(0.5f);
+            const float32x4_t cr = vdupq_n_f32(float(colour & 255)), cg = vdupq_n_f32(float((colour >> 8) & 255)),
+                              cb = vdupq_n_f32(float((colour >> 16) & 255));
+            const uint32x4_t alpha = vdupq_n_u32(colour & 0xff000000u);
+            const float32x4_t tiny = vdupq_n_f32(1e-18f);   // (length over 1e-9, squared)
+            const int rot = p.rotation & 3;
+            for (; v0 + 4 <= vc; v0 += 4) {
+                const float32x4x3_t m = vld3q_f32(&pos[v0].x);
+                const float32x4_t mx = vmulq_f32(vnegq_f32(m.val[0]), v3);   // (kMirror)
+                const float32x4_t mz = vmulq_f32(m.val[2], v3);
+                const float32x4_t lx = vsubq_f32(vaddq_f32(vx, vmulq_f32(mx, vc4)), vmulq_f32(mz, vs4));
+                const float32x4_t ly = vaddq_f32(vaddq_f32(vy, vmulq_f32(mx, vs4)), vmulq_f32(mz, vc4));
+                const float32x4_t lz = vaddq_f32(vz, vmulq_f32(m.val[1], v3));
+                float32x4_t ax, ay, h;   // Projector::box's and depth's sums for this rotation
+                switch (rot) {
+                case 0: ax = vsubq_f32(lx, ly), ay = vaddq_f32(lx, ly), h = vaddq_f32(lx, ly); break;
+                case 1: ax = vsubq_f32(vnegq_f32(lx), ly), ay = vsubq_f32(lx, ly), h = vsubq_f32(lx, ly); break;
+                case 2: ax = vaddq_f32(vnegq_f32(lx), ly), ay = vsubq_f32(vnegq_f32(lx), ly), h = vsubq_f32(vnegq_f32(lx), ly); break;
+                default: ax = vaddq_f32(lx, ly), ay = vaddq_f32(vnegq_f32(lx), ly), h = vaddq_f32(vnegq_f32(lx), ly); break;
+                }
+                float32x4_t sx4 = vmulq_f32(ax, hw), sy4 = vmulq_f32(ay, hh);
+                sy4 = vsubq_f32(sy4, vmulq_f32(vmulq_f32(lz, up), c30));
+                sx4 = vaddq_f32(vaddq_f32(sx4, offx0), cadge);
+                sy4 = vaddq_f32(vaddq_f32(sy4, offy0), base);
+                vst1q_f32(&sx[v0], sx4);
+                vst1q_f32(&sy[v0], sy4);
+                vst1q_f32(&depth[v0], vaddq_f32(vmulq_f32(h, kdiag), vmulq_f32(lz, kheight)));
+                // The normal in lot space (z up), made unit length.
+                const float32x4x3_t n = vld3q_f32(&nrm[v0].x);
+                const float32x4_t nx = vnegq_f32(n.val[0]), nz = n.val[2];   // (kMirror)
+                const float32x4_t ux = vsubq_f32(vmulq_f32(nx, vc4), vmulq_f32(nz, vs4));
+                const float32x4_t uy = vaddq_f32(vmulq_f32(nx, vs4), vmulq_f32(nz, vc4));
+                const float32x4_t uz = n.val[1];
+                const float32x4_t len2 = vaddq_f32(vaddq_f32(vmulq_f32(ux, ux), vmulq_f32(uy, uy)), vmulq_f32(uz, uz));
+                float32x4_t r = vrsqrteq_f32(len2);
+                r = vmulq_f32(r, vrsqrtsq_f32(vmulq_f32(len2, r), r));
+                r = vmulq_f32(r, vrsqrtsq_f32(vmulq_f32(len2, r), r));
+                const uint32x4_t long_enough = vcgtq_f32(len2, tiny);
+                r = vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(r), long_enough));   // (none: the zero vector)
+                const float32x4_t nlx = vmulq_f32(ux, r), nly = vmulq_f32(uy, r), nlz = vmulq_f32(uz, r);
+                auto dot = [&](const float32x4_t &dx, const float32x4_t &dy, const float32x4_t &dz) {
+                    return vaddq_f32(vaddq_f32(vmulq_f32(nlx, dx), vmulq_f32(nly, dy)), vmulq_f32(nlz, dz));
+                };
+                const float32x4_t k = vaddq_f32(lev, vmulq_f32(lev, vmaxq_f32(zero, dot(lx4, ly4, lz4))));
+                float32x4_t lamp = zero;
+                for (int j = 0; j < lamps; j++)
+                    lamp = vaddq_f32(lamp, vmulq_f32(vdupq_n_f32(lamp_strength[j]),
+                                                     vmaxq_f32(zero, dot(vdupq_n_f32(lamp_dir[j].x), vdupq_n_f32(lamp_dir[j].y),
+                                                                         vdupq_n_f32(lamp_dir[j].z)))));
+                const float32x4_t kr = vminq_f32(one, vaddq_f32(k, lamp));
+                const float32x4_t kg = vminq_f32(one, vaddq_f32(k, vmulq_f32(lamp, g251)));
+                const float32x4_t kb = vminq_f32(one, vaddq_f32(k, vmulq_f32(lamp, b209)));
+                const uint32x4_t tr = vcvtq_u32_f32(vaddq_f32(vmulq_f32(kr, cr), half));
+                const uint32x4_t tg = vcvtq_u32_f32(vaddq_f32(vmulq_f32(kg, cg), half));
+                const uint32x4_t tb = vcvtq_u32_f32(vaddq_f32(vmulq_f32(kb, cb), half));
+                const uint32x4_t t4 = vorrq_u32(vorrq_u32(alpha, vshlq_n_u32(tb, 16)), vorrq_u32(vshlq_n_u32(tg, 8), tr));
+                vst1q_u32(&tint[v0], t4);
+            }
+        }
+#endif
+        for (size_t v = v0; v < vc; v++) {
             float lx, ly, lz;
             to_lot(pos[v], lx, ly, lz);
             p.screen(lx, ly, lz, sx[v], sy[v]);
@@ -753,6 +838,8 @@ bool draw_sim_turned(DrawList *out, DrawMesh *mesh_out, const Projector &p, Char
             mesh_out->part_lx[i] = lx, mesh_out->part_ly[i] = ly, mesh_out->part_lz[i] = lz;
             mesh_out->parts_found |= uint8_t(1u << i);
         }
+        g_copy_us[0] += pose_us(t_part);
+        FastClock::time_point t_copy = FastClock::now();
         mesh_out->tris.clear();
         mesh_out->tris.reserve(order.size());
         float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
@@ -767,8 +854,18 @@ bool draw_sim_turned(DrawList *out, DrawMesh *mesh_out, const Projector &p, Char
             m.texture = t.texture;
             mesh_out->tris.push_back(m);
         }
+        g_copy_us[1] += pose_us(t_copy);
+        t_copy = FastClock::now();
         if (++mesh_out->pose_stamp == 0)   // (a new pose; never 0, which means no vertices kept)
             mesh_out->pose_stamp = 1;
+        {   // (summed in the order the viewer's sort summed them, so a Sim's mean is the same number)
+            float sum = 0;
+            for (const MeshTri &m : mesh_out->tris)
+                sum += (m.dv[0] + m.dv[1] + m.dv[2]) / 3;
+            mesh_out->depth_sum = sum;
+            mesh_out->depth_count = uint32_t(mesh_out->tris.size());
+            mesh_out->depth_for = mesh_out->pose_stamp;
+        }
         // Its vertices as the GL renderer takes them (DrawMesh::gpu), made here on the posing
         // thread rather than by the depth pass on the frame's thread (the same work there was ~1.2
         // ms a Sim a frame on the Vita, 2026-11-07): back to front for the depth pass, and by
@@ -788,6 +885,8 @@ bool draw_sim_turned(DrawList *out, DrawMesh *mesh_out, const Projector &p, Char
             for (const MeshTri &m : mt)
                 for (int i = 0; i < 3; i++)
                     g.depth.push_back(vertex(m, i));
+            g_copy_us[2] += pose_us(t_copy);
+            t_copy = FastClock::now();
             for (const MeshTri &m : mt) {
                 size_t b = 0;
                 while (b < g.buckets.size() && g.buckets[b].first != m.texture)
@@ -809,6 +908,7 @@ bool draw_sim_turned(DrawList *out, DrawMesh *mesh_out, const Projector &p, Char
                     g.colour[at[b]++] = g.depth[i * 3 + size_t(k)];
             }
             g.built_for = mesh_out->pose_stamp;
+            g_copy_us[3] += pose_us(t_copy);
         }
         if (mesh_out->tris.empty())
             x0 = y0 = x1 = y1 = 0;

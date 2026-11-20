@@ -6,7 +6,7 @@ for the Vita, that reads the original game's data and runs the game's own code f
 objects.
 
 The download contains no game data: you copy the folders from your own install of
-**The Sims Legacy Collection** to the Vita's memory card.
+**The Sims Legacy Collection** or **The Sims Complete Collection** to the Vita's memory card.
 
 > First public release, tested on two Vitas so far. If something doesn't work, please report it
 > (see [Reporting a problem](#reporting-a-problem)).
@@ -36,13 +36,18 @@ All taken on a PS Vita, at its own 960 × 544.
   the Vita's face buttons and sticks, not a PC mouse. Point with the left stick and press ✕, or just
   tap; pie menus you can steer with the stick; catalogues in a side panel you page through with L / R;
   pinch to zoom and twist to rotate; the right stick moves the view. A bar along the bottom always
-  shows what each button does right then. Remastered mode buttons, a battery saver setting, ~30 fps on
-  most lots.
+  shows what each button does right then. Remastered mode buttons, a battery saver setting, and up to
+  60 fps (or a steady 30, your choice).
 - **Saves:** every lot saved on the memory card, with autosave.
 - **Ad hoc Share:** send a lot, with its family, from one Vita to another nearby (no internet
   needed). Custom content used on the lot can go with it. From the internet button on a town's map.
 - **To and from the PC game:** export a family from the Vita's neighbourhood map for the PC version
-  (Legacy Collection) and import the PC game's family files (`.FAM`) on the Vita.
+  (Legacy Collection) and import the PC game's family files (`.FAM`) on the Vita (see
+  [Moving families between the Vita and the PC](#moving-families-between-the-vita-and-the-pc)).
+- **Eighteen languages:** English (US and UK), French, German, Italian, Spanish, Dutch, Danish,
+  Swedish, Norwegian, Finnish, Portuguese, Polish, Japanese, Chinese (Simplified and Traditional),
+  Korean and Thai, with the game's own fonts for each. The game asks at its first start; change it
+  later in Options › Game › Language.
 - **Custom content:** the install's own `Downloads` are read, and more can be added in
   `ux0:data/TheSimsVita/Downloads` (see [Files on the memory card](#files-on-the-memory-card)).
 - **Optional gameplay modifiers** (all off unless you choose them; see
@@ -54,17 +59,22 @@ All taken on a PS Vita, at its own 960 × 544.
 - **The shader compiler** `ur0:data/libshacccg.suprx`. If you've installed other vitaGL ports, you
   already have it. If not, install [ShaRKF00D](https://github.com/Rinnegatamante/ShaRKF00D/releases),
   run it and choose to extract the compiler.
-- **The Sims Legacy Collection**, installed on a PC (Steam or the EA app).
+- **The Sims Legacy Collection** (Steam or the EA app) or **The Sims Complete Collection** (the
+  2005 discs), installed on a PC.
 - About **3 GB free** on the Vita's memory card (`ux0:`).
 
-Other editions of The Sims (the original discs, the Complete Collection) have not been tested.
+The Complete Collection has been tested on PC and gives the same game as the Legacy Collection.
+A player reports that **The Sims 8 in 1** bundle works as well (not tested by us).
+Other editions (the original discs with the expansion packs installed one by one) have not been
+tested.
 
 ## Installing
 
 1. **Download** `TheSimsVita-vX.Y.vpk` from the [latest release](../../releases/latest).
 2. **Find your game's install folder** on the PC. In Steam: right-click The Sims Legacy Collection ›
    Manage › Browse local files. Usually
-   `C:\Program Files (x86)\Steam\steamapps\common\The Sims Legacy Collection`.
+   `C:\Program Files (x86)\Steam\steamapps\common\The Sims Legacy Collection`. The Complete
+   Collection's is usually `C:\Program Files (x86)\Maxis\The Sims`.
 3. **Copy the game's files to the Vita.**
    1. Connect the Vita: start VitaShell and press **SELECT**. The Vita's memory card shows up as a
       drive on the PC (USB mode; VitaShell's settings can turn SELECT to FTP instead, for Wi-Fi).
@@ -111,6 +121,15 @@ The bar along the bottom always shows what the buttons do at that moment.
 START opens the options: the view (walls up, cut away, down, roofs), music and sound volumes, pointer
 and camera speed, free will, hints and more, saving, and going back to the neighbourhood.
 
+- **Language:** asked for at the first start; after that in Options › Game › Language (restart the
+  game for a change to take effect; the first start in a new language indexes the game's files again).
+- **FPS counter:** Options › Display › FPS counter shows or hides the frame rate at the top of the
+  screen.
+- **Frame rate:** Options › Display › Frame rate: **Target 60 fps** (the default; a busy lot runs what it
+  can) or **30 fps capped** (steadier, and easier on the battery).
+- **Edge scrolling:** Options › Controls › Edge scrolling: on (the default), the view moves when the pointer
+  reaches the edge of the screen; off, only the right stick and touch move it.
+
 ### Gameplay modifiers
 
 Options › Game › Gameplay modifiers. Ways to play that differ from the original game, each at its
@@ -127,6 +146,48 @@ original setting unless you change it; **Set to Default** puts them all back.
 | Stray pets visit | on, off |
 | Critters (El Bandito the raccoon, the skunk) | on, off |
 | Community bug fixes | on, off: fixes for bugs in the original game that the community made as patch files, done in the engine |
+| Kids make quick meals | off (original), on: children make a quick meal from the fridge and cook it in a microwave or toaster oven, after the community's mod |
+
+## Moving families between the Vita and the PC
+
+The Vita's saves (`ux0:data/TheSimsVita/saves/`) are in the port's own format, so the PC game can't
+open them directly. Families and their lots move between the two as the PC game's own family files
+(`.FAM`), the same files its Import Family / Export Family buttons use.
+
+On the PC, the Legacy Collection keeps them in
+`%USERPROFILE%\Saved Games\Electronic Arts\The Sims 25\UserData\` (the folders `Export`, `Import`
+and `Houses`). Connect the Vita as in [Installing](#installing) (VitaShell, **SELECT**) to copy files.
+
+### From the Vita to the PC
+
+1. On the Vita, go to the neighbourhood map and press the **Export** button on its bar (beside the
+   Ad hoc Share button). Choose the lot.
+2. The game writes the file to `ux0:data/TheSimsVita/Export/`:
+   - a lot with a family: `<Family>_<number>.FAM` (e.g. `Newbie_1.FAM`);
+   - an empty lot: `HouseNN.iff`, the house alone.
+3. Copy it to the PC:
+   - a `.FAM` goes into the PC game's `UserData\Import` folder. Start the PC game and use
+     **Import Family** on its neighbourhood screen;
+   - a `HouseNN.iff` goes into the PC game's `UserData\Houses` folder, in place of the file of the
+     same name (back that file up first).
+
+The file carries the house as it stands on the Vita: walls and wall coverings, floors, fences,
+terrain, grass, pools and water, with the objects and the family.
+
+### From the PC to the Vita
+
+1. On the PC, the game writes a family's file each time its lot is saved:
+   `UserData\Export\<Family>_<number>.FAM`.
+2. Copy that file to `ux0:data/TheSimsVita/Import/` on the Vita (make the folder if it isn't there).
+3. On the Vita, open the main neighbourhood's map. The **Import** button on its bar lights up when a
+   file is waiting: press it, and the game shows the family and the lot it will move into (the lot
+   number kept in its file; a family living there is moved out to the family bin) and asks before
+   doing it. With no file waiting, the same button undoes the last import.
+
+### Backing up the Vita's saves
+
+Copy the whole `ux0:data/TheSimsVita/saves/` folder to the PC. To restore, quit the game and copy
+it back.
 
 ## Files on the memory card
 

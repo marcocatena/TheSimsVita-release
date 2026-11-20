@@ -14,6 +14,8 @@
 // routine cache and the primitive table.
 #pragma once
 
+#include <atomic>
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -90,6 +92,10 @@ enum EntityFlag : uint16_t {
 class Vm;
 class Thread;
 class Entity;
+
+// What in a Sim's person data is one lot's own (the object they are taken up with, 59, and the sofa's seat mark):
+// taken off a neighbourhood record or a Sim made from one (vm.cpp).
+void clear_lot_marks(std::vector<int16_t> &person_data);
 
 // A BHAV, ready to run.
 struct Routine {
@@ -294,7 +300,8 @@ public:
     // Runs an interaction's check tree for this thread's entity. With `ads`,
     // also what the check tree changed in the interaction's advertisements
     // (`ia`'s TTAB entries are what it reads before it changes them).
-    bool check(const QueuedAction &action, std::map<int, int16_t> *ads = nullptr, const TtabInteraction *ia = nullptr);
+    bool check(const QueuedAction &action, std::map<int, int16_t> *ads = nullptr, const TtabInteraction *ia = nullptr,
+               bool on_its_own = false);
     // Advertisement changes a running check tree makes (the TreeAd scopes,
     // FreeSO MotiveAdChanges), keyed (kind << 16) | motive: kind 0 min, 1 range, 2 personality.
     std::map<int, int16_t> ad_changes;
@@ -312,6 +319,9 @@ public:
     // Stacks kept for run_now (a check tree run beside the thread's own stack), their room
     // kept: autonomy runs some two hundred checks a choice, each had its stack made afresh.
     std::vector<std::vector<Frame>> spare_stacks;
+    // The thread's own stack(s) while run_now has it set aside (a check within a check: one each), for
+    // what asks what the Sim is doing meanwhile ("Test Sim Interacting With" in a check tree).
+    std::vector<const std::vector<Frame> *> aside_stacks;
     std::vector<QueuedAction> queue;   // [0] runs when an interaction is on the stack
     bool interrupt = false;            // Notify Out Of Idle
     uint16_t next_uid = 1;
@@ -323,6 +333,7 @@ public:
     // While a pie menu's check tree runs: the entries it names (Change Action String), with
     // the stack object each is about (FreeSO VMThread.ActionStrings).
     std::vector<std::pair<std::string, int16_t>> *action_strings = nullptr;
+    bool check_wrote_stack = false;   // a menu's check tree set the stack object itself (change_action_string)
     int ticks_this_frame = 0;
     int64_t long_run = 0;     // instructions of a run that has gone on over several ticks
     int resting = 0;   // ticks left before a thread that looped for ever runs again
@@ -424,6 +435,7 @@ public:
     int64_t list_key = 0;
     uint64_t seq = 0;
     uint32_t snapped_at = 0;   // the tick a Snap last moved this Sim (into a seat, out of one, aside)
+    uint16_t stranded_ticks = 0;   // a Sim at home, out of the world with nothing running: for how long (Vm::rescue_stranded)
     Entity *container = nullptr;
     int16_t container_slot = -1;
     std::vector<Entity *> slots;   // what this holds, by slot
@@ -502,6 +514,9 @@ public:
         // Mortimer's pace, its d2o-walking-loop's stride a second 0.44 of his); ours moved every
         // walker at the adult's, the skunk's and children's feet sliding.
         float stride_scale = 1.0f;
+        // The walk loop start_walk put on (only compared, never read): stepping with another animation
+        // playing, it's put on again (Entity::walk_step).
+        const CharAnimation *walk_anim = nullptr;
         float walk_frames = 0;   // animation frames walked since setting off (kWalkAnimSpeed a tick), for walk-half
         // The exe's walker (FUN_005d33b0): the start of the segment walked (the last point passed),
         // and the look-ahead radius, a quarter of the walk loop's stride in sixteenths (an adult's
@@ -714,6 +729,9 @@ struct BuildItem {
     enum { kTerrainRaise = 0, kTerrainLower = 1, kTerrainLevel = 2, kTerrainGrass = 3, kTerrainSand = 4 };
     static bool paints_ground(uint16_t pattern) { return pattern == kTerrainGrass || pattern == kTerrainSand; }
     std::string name, description;
+    // A floor's or covering's English name and description, in another language shown (Options >
+    // Game > Language): the sub-groups are found by English words (build_subgroup); empty: as above.
+    std::string english_name, english_description;
     int price = 0;
     uint16_t pattern = 0;               // wall tool: style id; floor/wall covering: global id
     std::string file;                   // a covering in its own .flr/.wll file
@@ -856,6 +874,16 @@ public:
     // A whole STR# table of one file (English), empty if absent.
     std::vector<std::string> strings(const LoadedIff *file, uint16_t table);
     const Ttab *ttab(const LoadedIff *file, uint16_t id);
+    // "All stereo stations" (all_stations): a stereo's interactions with the jukebox's five House Party
+    // stations after its own (null: not one of the three stereo files, or no jukebox in the install); the
+    // names of those five; every stereo on the lot given the table or its own back, as the switch stands.
+    static constexpr uint32_t kStationEntry = 0x7f00;   // their TtabInteraction::tta_index, + 0..4
+    const Ttab *stations_table(const Entity &e);
+    const std::string *station_name(uint32_t tta_index) const
+    {
+        return tta_index >= kStationEntry && tta_index < kStationEntry + 5 ? &station_names_[tta_index - kStationEntry] : nullptr;
+    }
+    void apply_stations();
 
     // What the player can do. The interactions `sim` may choose on `obj` now
     // (their check trees pass), by name with their TTA numbers.
@@ -896,6 +924,7 @@ public:
     // Cancels the last thing `sim` has queued (or what they are doing, if nothing is).
     bool cancel_last(Entity &sim);
     int16_t selected_id = 0;
+    int16_t studio_traveller = 0;   // generic call 35: the Sim who set off for Studio Town (the exe reads it for the map cursor)
     // A Sim of the family living here (everyone else is a visitor).
     bool resident(const Entity &e) const;
     // The exe's visitor rule (FUN_0060b110, every menu, choice and start): someone not of the
@@ -1008,6 +1037,8 @@ public:
     int route_rect_failed = 0;    // its plans that found no path this tick (the tile planner then tried)
     // The object whose code is running now (0 between), for the viewer's watchdog.
     int running_id = 0;
+    // Makin' Magic's spell controller (its attributes 0-5: what the family has made; Family::spells).
+    static constexpr uint32_t kSpellController = 0xb6c90029u;
     const Family *family() const
     {
         if (!hood)
@@ -1033,9 +1064,15 @@ public:
     // home isn't in the save.
     void end_trip_here();
     // Family members missing from their own lot altogether, built again at the door (see vm.cpp).
-    int restore_missing_family();
+    int restore_missing_family(const Entity *beside = nullptr);
     // Other families' members left on this lot by a trip's save, taken off it (see vm.cpp).
     int remove_visiting_families();
+    // A home with two living Sims of the same family member (a move-in that made everyone twice, to
+    // 2026-11-16): the extra removed, the one the player had selected kept (else the first). How many went.
+    int remove_family_clones();
+    // A member of the family living here left out of the world with no interaction running (a trip's
+    // script that ended false): after 20 game minutes of it, set down at the street (see vm.cpp).
+    int rescue_stranded();
     // A family just moved in (from the neighbourhood, the lot fresh from its file): its Sims
     // made at the way in from the street, with their neighbourhood data, and started.
     void move_in(int16_t family_id);
@@ -1076,6 +1113,12 @@ public:
     // fix, the Pet Bath, the women's walk, the Obsessed Fan, the burglar, the butler's
     // fridge, the burger plate, Waylon's fame. Off: as the original.
     bool community_fixes = true;
+    // Gameplay modifiers after the community's mods (the user's, 2026-11-18; off: the original's):
+    // children may make a quick meal at the fridge and cook it in a microwave or toaster oven
+    // (Vm::fixed_answer, passes_entry_check, animation_for); every stereo has the five House Party
+    // stations the jukebox has (Vm::ttab_for, Vm::routine; taken up when a lot is opened); the Triple
+    // Bull Dartboard stays on a home lot (Vm::fixed_answer; the viewer's catalogue sells it there).
+    bool kids_quick_meals = false, all_stations = false, dart_board_home = false;
     // The player's option "Friendships fade" (2026-10-30): points a day the family's daily
     // relationship scores move toward 0, at the day's turn; 0 leaves them (the engine has no
     // decay of its own; the original's daily rule and rate are not read yet).
@@ -1100,6 +1143,16 @@ public:
     // The view's camera angle (0-3), given by the viewer while the game's thread is idle: what
     // "look towards the camera" turns a Sim to (the refusals, "I'm not in the mood").
     int camera_rotation = 0;
+    // A draw as the exe's (FUN_0061ee40, sims.c 422542): the same generator, the number its state before the step
+    // times a plus c, shifted down 16, in 32 bits (ours took the new state's bits from 8: the same spread, another
+    // sequence; the long-run audit, 2026-11-20). TS_RANDOM_BITS_OLD=1: as before.
+    uint32_t draw()
+    {
+        static const bool old = std::getenv("TS_RANDOM_BITS_OLD") != nullptr;
+        const uint32_t before = random_state;
+        random_state = random_state * 1103515245u + 12345u;
+        return old ? random_state >> 8 : uint32_t((uint64_t(before) * 1103515245u + 12345u) >> 16);
+    }
     // A lot opened with no family (global 32, the original's 0x456911): money doesn't count. Funds
     // read as 999,999 and nothing changes them (0x556e20, 0x5572f0), on every kind of lot.
     bool free_money() const { return globals[32] == 1; }
@@ -1160,6 +1213,10 @@ public:
         int objects = 0, architecture = 0, arch_objects = 0, walls = 0, coverings = 0, floors = 0, pool_tiles = 0;
     };
     LotValues lot_values() const;
+    // What a piece of architecture costs: kind 0 a floor pattern, 1 a wall covering, 2 a wall style (the
+    // five wall tools' at their styles and the plain wall's at the diagonal's, 255; the rest nothing), 3 a
+    // pool tile (the Pool Tool's price). The exe pays 80% of it back when the piece is taken away.
+    int architecture_price(int kind, uint16_t pattern) const;
     // The live panel's House tab, as the original's (FUN_004dc390, its stats FUN_0056b460, read
     // 2026-11-10): square feet (9 a tile of every inside room), bedrooms (inside rooms with a bed,
     // category 4) and bathrooms (5, 6, 7: toilet, tub, shower), the lot's size word (0 small under 40
@@ -1206,6 +1263,10 @@ public:
     // Makes one (age in years, gender 0 male 1 female, skin as the game numbers it in person data
     // 60: 1 light, 2 dark, 3 medium): the new neighbour's id, 0 if it can't.
     int16_t make_character(int age, int gender, int skin_number, const std::string &name = {});
+    // A copy of a Sim (Make New Character with a negative age: the exe's FUN_0061a3a0, sims.c 418605-418672:
+    // the caller's body strings, age, skin, sex and name; the person data the template's): the chemistry
+    // set's evil clone, Makin' Magic's clone charms.
+    int16_t make_clone(const Entity &of);
     // A pet bought at a pen (Unleashed): a copy of the template dog or cat with the coat numbered
     // `coat` among pet_coats(); its neighbour id, 0 if it can't be made.
     int16_t make_pet(bool dog, int coat, bool female, const std::string &name);
@@ -1248,12 +1309,13 @@ public:
     // original's: "There is no cost for roofs"). Whether it changed anything.
     bool set_roof(const BuildItem &item);
     int build_pool(int x0, int y0, int x1, int y1, int level, const BuildItem &item, bool erase, std::string &why);
+    void make_pool_ring();   // the exe's FUN_0063a6a0: the dry ring round the pools (Lot::pool_ring)
     // Walls: a straight run between grid corners (x0, y0) and (x1, y1), or
     // taking one down.
     int build_walls(int x0, int y0, int x1, int y1, int level, const BuildItem &tool, bool erase, std::string &why);
     // A wall covering on one face: the wall on `edge` (0 north, 1 east, 2 south,
     // 3 west) of tile (x, y), the face seen from that tile.
-    int build_wallpaper(int x, int y, int level, int edge, const BuildItem &item, std::string &why);
+    int build_wallpaper(int x, int y, int level, int edge, const BuildItem &item, std::string &why, bool erase = false);
     // A diagonal run (corner to corner at 45 degrees; build_walls hands these on).
     int build_diagonal(int x0, int y0, int x1, int y1, int level, const BuildItem &tool, bool erase, std::string &why);
     // The room tool: walls round the rectangle from corner (x0, y0) to (x1, y1).
@@ -1271,6 +1333,7 @@ public:
     // step, or (how 0) brought to the height of corner (x0, y0). Corners at floors, walls or
     // objects stay as they are.
     int shape_terrain(int x0, int y0, int x1, int y1, int how, std::string &why);
+    int shape_terrain_old(int x0, int y0, int x1, int y1, int how, std::string &why);   // (TS_TERRAIN_OLD=1)
     // Grass on the tiles from (x0, y0) to (x1, y1): grown (lush) or taken away; a simoleon a tile.
     int paint_grass(int x0, int y0, int x1, int y1, bool grow, std::string &why);
     // The lot's pattern number for a covering (adding a .flr/.wll file to the lot's map).
@@ -1289,6 +1352,14 @@ public:
     bool lot_changed = false;   // the house differs from its lot file (saves keep it)
     uint32_t lot_version = 0;   // counts changes (the viewer redraws the house)
     uint64_t edits = 0;         // counts changes to objects made between ticks (buying, moving, selling, building)
+    // This game among all made in this run (never two the same; a game's address is taken again by the next):
+    // with ticks and edits, what the viewer keeps of a game's state is known to be of this one, as it stands.
+    static uint64_t next_serial()
+    {
+        static std::atomic<uint64_t> made{ 0 };
+        return ++made;
+    }
+    uint64_t serial = next_serial();
     // Objects bought by the player, by id: price and the day (sold back at full price that day).
     std::map<uint16_t, std::pair<int, int>> bought;
     int day_number() const { return clock.year * 360 + (clock.month - 1) * 30 + clock.day; }
@@ -1386,6 +1457,19 @@ public:
         bool blocking = true;
         int response = -1;
         std::string text;   // a text entry's (type 3) answer: the name typed
+        // A book (Makin' Magic's spellbook and cookbook: dialog types 12 and 15, one window in the exe,
+        // FUN_00494390): 0 none, 1 the adults' spellbook, 2 a child's, 3 the cookbook; `title` its title
+        // ("%s Family Spellbook"). Each entry a spell, charm or recipe in the book's order: its title and
+        // words ("Unknown Charm" and how to find out, until the family has made it), the three ingredients'
+        // objects (GUIDs, always shown) and the picture of what makes it (UIGraphics 90-94).
+        struct BookEntry {
+            std::string title, words;
+            uint32_t ingredient[3] = {};
+            int picture = 0;
+        };
+        int book = 0;
+        std::string book_back, book_next, book_page;   // "back", "next", "Page %d of %d"
+        std::vector<BookEntry> book_entries;
         // A chooser (the phone book: type 10): what to pick from, by number
         // (a neighbour id), and the number picked (with response 0; 1 cancels).
         std::vector<std::pair<int16_t, std::string>> choices;
@@ -1487,6 +1571,12 @@ private:
     std::unordered_map<std::pair<const LoadedIff *, uint16_t>, std::unique_ptr<Bcon>, FileIdHash> constants_;
     std::unordered_map<std::pair<const LoadedIff *, uint16_t>, std::unique_ptr<Routine>, FileIdHash> routines_;
     std::map<std::pair<const LoadedIff *, uint16_t>, std::unique_ptr<Ttab>> tables_;
+    // (all_stations) A stereo's own table -> the one with the stations; the jukebox's routines the
+    // stereos' ids 4160-4169 stand for (test, action a station); the entries' names; the switch as applied.
+    std::map<const Ttab *, std::unique_ptr<Ttab>> station_tables_;
+    uint16_t station_routines_[10] = {};
+    std::string station_names_[5];
+    bool stations_applied_ = false;
     std::vector<Entity *> by_id_;
     std::vector<int16_t> person_ids_;
     uint32_t person_ids_tick_ = ~0u;

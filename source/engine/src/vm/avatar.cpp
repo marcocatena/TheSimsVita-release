@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <set>
 
 #include "core/env.h"
 #include "vm/vm.h"
@@ -363,7 +364,36 @@ void Entity::tick_route(Vm &vm)
     // every corner (the user, 2026-11-10: "they continue walking and turning" in the original).
     static const bool walk_old = TS_ENV("TS_WALK_OLD") != nullptr;
     if (!walk_old) {
+#if !defined(__vita__)
+        // Debug (TS_SLIDE_CHECK=1): a person who moves on this tick without the walk or run loop playing
+        // is drawn in whatever pose it holds, gliding (the user, 2026-11-17: "sims just standing and sliding
+        // with no walk animation"). Each such walk noted once, with what plays instead.
+        static const bool slide_check = TS_ENV("TS_SLIDE_CHECK") != nullptr;
+        const float was_x = route.fx, was_y = route.fy;
         walk_step(vm);
+        if (slide_check && person && (route.fx != was_x || route.fy != was_y)) {
+            const AnimState *now = current_animation();
+            const std::vector<std::string> &mv = vm.moves(*this);
+            auto same = [](const std::string &a, const std::string &b) {
+                if (a.size() != b.size())
+                    return false;
+                for (size_t k = 0; k < a.size(); k++)
+                    if (std::tolower(uint8_t(a[k])) != std::tolower(uint8_t(b[k])))
+                        return false;
+                return true;
+            };
+            const std::string name = now && now->anim ? now->anim->name : std::string("(nothing)");
+            const bool walks = (mv.size() > 20 && same(name, mv[20])) || (mv.size() > 21 && same(name, mv[21]));
+            static std::set<std::pair<int, size_t>> told;
+            if (!walks && told.insert({ int(id), route.path.size() * 1000 + size_t(uint16_t(route.from_x)) }).second)
+                std::printf("slide: tick %u #%d %s moves along %lu points with %s playing (walk table %lu: %s), held %s, in pool %d\n",
+                            unsigned(vm.ticks), int(id), info ? info->label.c_str() : "?", (unsigned long)route.path.size(),
+                            name.c_str(), (unsigned long)mv.size(), mv.size() > 20 ? mv[20].c_str() : "-",
+                            held.anim ? held.anim->name.c_str() : "-", int(vm.in_pool(*this)));
+        }
+#else
+        walk_step(vm);
+#endif
         return;
     }
     // How far is left of the whole walk, in frames: setting off speeds up, the end slows down.
@@ -620,6 +650,18 @@ void Entity::walk_step(Vm &vm)
         }
     route.blocked_by = 0;
     route.yield_start = 0;
+    // Stepping with something else playing: the walk loop back on. A walk that waited (blocked, asking
+    // someone to move, giving way, the game's "route waiting") had the standing loop or an idle put on
+    // for the wait, and nothing put the walk back: the rest of it glided along in that pose (PC, seven
+    // lots, five game hours: 98 such walks, 31 at the diner and 45 at Solana; the user, 2026-11-17:
+    // "sims just standing and sliding with no walk animation"). The exe's walker sets the walk loop as
+    // it steps (FUN_005d33b0). TS_SLIDE_OLD=1: as before.
+    static const bool slide_old = TS_ENV("TS_SLIDE_OLD") != nullptr;
+    if (!slide_old && person && !route.turning) {
+        const AnimState *now = current_animation();
+        if (!now || !now->anim || now->anim != route.walk_anim)
+            start_walk(vm);
+    }
     route.walk_frames += kWalkAnimSpeed;
     route.fx = nx;
     route.fy = ny;
@@ -692,8 +734,10 @@ void Entity::start_walk(Vm &vm)
     // run comes next time. Its 670 KB read on the spot was a 90 ms tick on the Vita.)
     if (loop == 21 && vm.animation_waits(moves[21]))
         loop = 20;
+    route.walk_anim = nullptr;
     if (moves.size() > loop)
         if (const CharAnimation *a = vm.animation(moves[loop])) {
+            route.walk_anim = a;
             if (TS_ENV("TS_WALK"))   // debug: the walk loop's own speed
                 std::printf("walk %s: %.3f over %.0f ms, moving %d, %u translations\n", a->name.c_str(), a->distance,
                             a->duration, int(a->moving), unsigned(a->translations.size()));

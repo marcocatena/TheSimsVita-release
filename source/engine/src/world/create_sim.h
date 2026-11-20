@@ -23,6 +23,21 @@ namespace ts {
 class Content;
 struct ObjectInfo;
 
+// The game's own template for a townie of that family (person data 61), 0 none; what the original copies each
+// from, by the first-run neighbourhood's characters (private/fresh_userdata: each one's routines byte for byte
+// those of a file of TemplateNPCs): HDT_Generic.iff for Hot Date's townies (2000: 16 of 30), Vacation's tourists,
+// adults and children (3000-3009: all 33) and Superstar's fans (5500: all 18); the ready-made Hot Date townies
+// each their own kind's file, HDT_<Bombshell|DonJuan|Fatale|LoungeL|Party|WallFlower>_<sex><tone>.iff (14 of
+// 30: known here by the look, `body`'s body and head, which was taken from that file); SSCelebGeneric.iff for
+// the celebrities (5000: all 12); MMClownieGeneric.iff for Makin' Magic's (6000: all 30). Their code gives a
+// townie, the first time it is put on a lot, what ours left at nothing: a personality (25 points among the
+// five when it has none; a kind's own: Party's outgoing 800, nice 700, playful 700, neat 100), a career and
+// level (Hot Date's adults with no job: at random; a kind's own), its interests (a kind's own), person data 8
+// (a celebrity's), a wand, skills and a job (Magic Town's). Ours made them all from the plain person
+// template (interests only). TS_TOWNIE_TEMPLATE_OLD=1: the plain template for all but Magic Town's;
+// TS_STRANGE_TEMPLATE_OLD=1: for Magic Town's; TS_TOWNIE_KINDS_OLD=1: HDT_Generic for the ready-made too.
+uint32_t townie_template(Content &content, int family, const std::vector<std::string> *body = nullptr);
+
 // A head or body suit and its texture in the chosen tone ("b004mafit_01", "b004mafitlgt_01").
 struct CasPart {
     std::string suit, texture;

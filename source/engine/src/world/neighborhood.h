@@ -67,6 +67,16 @@ struct Family {
     std::vector<uint32_t> members;   // person object GUIDs
     bool made = false;     // made in Create-A-Family (kept in the engine's neighbourhood save)
     bool imported = false; // brought in from a .FAM (world/hood_import.h): a made family, known as that from Neighborhood::imports
+    // Makin' Magic: what the family has made (the spell controller's attributes 0-5, the "made" bit fields:
+    // the exe keeps them on the family record, FAMI version 9, written at a save of the home lot and given
+    // back to the lot's controller by generic call 43: sims.c 291813, FUN_0057a0e0). Kept in the engine's
+    // neighbourhood save (16).
+    int16_t spells[6] = { 0, 0, 0, 0, 0, 0 };
+    // The record's flags word (FAMI, after the friends count): bit 0 the family's home lot has a phone (an object
+    // of category 1), bit 1 a baby (category 9), set from the lot's objects at its save (the exe's FUN_0056ad40 /
+    // FUN_0056be00 over FUN_0052ca90). "Neighbor in stack object" data 7 and 8 read them. Kept in the
+    // neighbourhood save (17).
+    int flags = 0;
 };
 
 // A family brought in from a family file (the install's UserData*/Patch/*.FAM: Unleashed's Kats,
@@ -174,6 +184,7 @@ struct Neighborhood {
     // lot file's SIMI otherwise. Worked out as the game saves a lot (Vm::lot_values).
     std::map<int, std::pair<int, int>> lot_values;
     std::set<int> bulldozed;               // houses bulldozed to an empty lot (their file opens cleared)
+    std::set<int> lot_texts_known;   // lots with a name entry in the area's description file, even empty
     std::map<int, std::string> lot_names;  // downtown, vacation, ... lots: their names (the *Desc.iff files)
     std::map<int, std::string> lot_descs;  // and their descriptions
     // Each house's street, as a format with the number in it ("%s Maple Street"): StreetNames.iff in
@@ -242,6 +253,29 @@ struct Neighborhood {
     bool in_a_family(uint32_t guid) const;   // a member of a family with a number
     const Family *family_in_house(int house) const;
     Family *family_in_house(int house);
+    // Whether the family is away on a trip. The trip's record stays after they come home (the lot
+    // they arrive on reads their needs and the time from it; the next trip writes over it), reading
+    // "to their own house": that is a family at home. Asked by the family alone, everyone who had
+    // ever come home by taxi stayed "on vacation": no eviction, no rezoning, no share or import of
+    // their lot (the user's Granges, 2026-11-17, home from the diner days before).
+    // Families left on vacation while something else is played (the exe's family record +0x13c, the vacation
+    // lot: set when a vacation lot 40-49 opens, cleared when a residential lot does, sims.c 67401 / 67476):
+    // their trip as it was, by family id. Their house opens onto the vacation lot.
+    std::map<int16_t, Travel> vacations;
+    bool family_away(const Family &f) const
+    {
+        return (travel.family == f.id && travel.to_house != f.house) || vacations.count(f.id) != 0;
+    }
+    // The family on vacation at lot `house` (the active trip's or one left there), 0 none.
+    int16_t vacation_at(int house) const
+    {
+        if (travel.family && travel.to_house == house && house >= 40 && house <= 49)
+            return travel.family;
+        for (const auto &[id, t] : vacations)
+            if (t.to_house == house)
+                return id;
+        return 0;
+    }
 };
 
 // Reads Neighborhood.iff and LotZoning.iff in a neighbourhood's folder

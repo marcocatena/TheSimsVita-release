@@ -102,6 +102,39 @@ int16_t Vm::make_character(int age, int gender, int skin_number, const std::stri
     return id;
 }
 
+int16_t Vm::make_clone(const Entity &of)
+{
+    if (!hood || !content.object(kTemplatePerson) || !of.person || !of.info)
+        return 0;
+    MadeCharacter m;
+    m.name = of.info->name.empty() ? of.info->label : of.info->name;
+    m.body = sim_body_strings(content, *of.info);
+    if (m.body.empty())
+        return 0;
+    do {
+        random_state = random_state * 1103515245u + 12345u;
+        m.guid = 0xF1000000u | (random_state >> 8 & 0xffffffu);
+    } while (content.object(m.guid));
+    int16_t id = 1;
+    for (const Neighbor &n : hood->neighbors)
+        id = std::max<int16_t>(id, int16_t(n.id + 1));
+    m.neighbor = id;
+    if (const Neighbor *t = hood->by_guid(kTemplatePerson))
+        m.person_data = t->person_data;
+    if (m.person_data.size() < 88)
+        m.person_data.resize(88, 0);
+    for (int trait : { 2, 3, 5, 6, 7 })
+        m.person_data[size_t(trait)] = 500;
+    for (int k : { 58, 60, 65 })   // age, skin, sex: the original's
+        if (of.person_data.size() > size_t(k))
+            m.person_data[size_t(k)] = of.person_data[size_t(k)];
+    m.person_data[31] = id;
+    if (!register_made(m))
+        return 0;
+    made_characters.push_back(m);
+    return id;
+}
+
 // After the strays' bodystrings (TemplateFamilyUnleashed/Strays_4000.FAM): the skeleton, the coat
 // as body, no head, the sex's animation set, "27", a tone, and nothing else.
 int16_t Vm::make_pet(bool dog, int coat, bool female, const std::string &wanted_name)
@@ -286,10 +319,28 @@ int16_t Vm::pet_to_person(Entity &pet)
     return int16_t(e->id);
 }
 
+// A pet's outfits are its kind's coats (type 0, the body: Unleashed's maternity box reads a parent's by generic
+// call 30 and puts it on the young by 29, PetMaternityBox 4123 "do pupate"; the pens' display animal changes
+// its by 24), numbered as pet_coats() lists them (make_pet's numbers). Ours answered from people's outfits: a
+// pet had none, so every kitten and puppy kept its template's first coat (the Unleashed audit, 2026-11-20).
+// TS_PET_COATS_OLD=1: as before.
+static bool pet_coats_on()
+{
+    static const bool old = TS_ENV("TS_PET_COATS_OLD") != nullptr;
+    return !old;
+}
+
 std::vector<std::string> Vm::suits_of(const Entity &sim, int type)
 {
     if (!sim.person || !sim.info)
         return {};
+    if (const char pet = pet_kind(sim); pet && pet_coats_on()) {
+        std::vector<std::string> out;
+        if (type == 0)
+            for (const auto &coat : pet_coats(content, pet == 'd'))
+                out.push_back(coat.first);
+        return out;
+    }
     return purchasable_outfits(content, sim_body_strings(content, *sim.info), type);
 }
 
@@ -297,6 +348,23 @@ int16_t Vm::suit_index(const Entity &sim, int type)
 {
     if (!sim.person || !sim.info)
         return -1;
+    if (const char pet = pet_kind(sim); pet && pet_coats_on()) {   // the coat: body string 1, "<suit>,BODY=<suit>"
+        const std::vector<std::string> body = sim_body_strings(content, *sim.info);
+        if (type != 0 || body.size() < 2)
+            return -1;
+        std::string worn = body[1].substr(0, body[1].find(','));
+        for (char &c : worn)
+            c = char(std::tolower(uint8_t(c)));
+        const auto coats = pet_coats(content, pet == 'd');
+        for (size_t i = 0; i < coats.size(); i++) {
+            std::string name = coats[i].first;
+            for (char &c : name)
+                c = char(std::tolower(uint8_t(c)));
+            if (name == worn)
+                return int16_t(i);
+        }
+        return -1;
+    }
     const std::vector<std::string> body = sim_body_strings(content, *sim.info);
     const int slot = outfit_slot(type);
     if (slot < 0 || size_t(slot) >= body.size())
@@ -318,6 +386,23 @@ int16_t Vm::set_suit(Entity &sim, int type, int index)
 {
     if (!sim.person || !sim.info)
         return -1;
+    if (const char pet = pet_kind(sim); pet && pet_coats_on()) {
+        const auto coats = pet_coats(content, pet == 'd');
+        std::vector<std::string> body = sim_body_strings(content, *sim.info);
+        if (type != 0 || index < 0 || size_t(index) >= coats.size() || body.size() < 2)
+            return -1;
+        const int16_t before = suit_index(sim, type);
+        body[1] = coats[size_t(index)].first + ",BODY=" + coats[size_t(index)].first;
+        content.set_body_strings(sim.info->guid, body);
+        if (hood)
+            if (Neighbor *n = hood->by_guid(sim.info->guid))
+                n->body = body;
+        looks_changed++;
+        if (TS_ENV("TS_SUITS"))   // debug
+            std::printf("coat set: %s coat %d (%s), was %d\n", sim.info->label.c_str(), index, coats[size_t(index)].first.c_str(),
+                        int(before));
+        return before;
+    }
     std::vector<std::string> body = sim_body_strings(content, *sim.info);
     const std::vector<std::string> suits = purchasable_outfits(content, body, type);
     const int slot = outfit_slot(type);

@@ -32,6 +32,46 @@ struct Builder {
     const Lot &lot;
     const RoomMap (&rooms)[kLotLevels];
     int below;   // the storey being roofed; the roof sits on the storey above it
+    const std::vector<uint8_t> *stairs_above = nullptr;
+    // The rooms of the storey being roofed with a tile on sloped ground: the exe roofs a room only if all
+    // its tiles are flat (FUN_00628b40, sims.c 430846). Empty: every room counts.
+    std::vector<uint8_t> unflat;
+
+    void find_unflat()
+    {
+        if (TS_ENV("TS_ROOF_STAIRS_OLD") || below < 0 || below >= kLotLevels)
+            return;
+        constexpr int V = W + 1;
+        if (lot.altitude.size() < size_t(V) * V)
+            return;
+        const RoomMap &r = rooms[below];
+        unflat.assign(r.outside.size(), 0);
+        for (int y = 0; y < W; y++)
+            for (int x = 0; x < W; x++) {
+                const uint8_t a = lot.altitude[size_t(x + y * V)];
+                if (lot.altitude[size_t(x + 1 + y * V)] == a && lot.altitude[size_t(x + (y + 1) * V)] == a &&
+                    lot.altitude[size_t(x + 1 + (y + 1) * V)] == a)
+                    continue;
+                const uint32_t v = r.map[size_t(x) + size_t(y) * W];
+                for (uint32_t room : { v & 0xffff, v >> 16 })
+                    if (room > 0 && room < unflat.size())
+                        unflat[room] = 1;
+            }
+    }
+    // Indoors on the storey being roofed, in a room the roof may go over.
+    bool roofed_room(int x, int y) const
+    {
+        if (!indoors(x, y, below))
+            return false;
+        if (unflat.empty() || x < 0 || y < 0 || x >= W || y >= W)
+            return true;
+        const uint32_t v = rooms[below].map[size_t(x) + size_t(y) * W];
+        const uint32_t a = v & 0xffff, b = v >> 16;
+        const RoomMap &r = rooms[below];
+        const bool a_ok = a < r.outside.size() && !r.outside[a] && !(a < unflat.size() && unflat[a]);
+        const bool b_ok = b > 0 && b < r.outside.size() && !r.outside[b] && !(b < unflat.size() && unflat[b]);
+        return a_ok || b_ok;
+    }
 
     bool indoors(int x, int y, int level) const
     {
@@ -46,6 +86,12 @@ struct Builder {
     {
         if (level < 0 || level >= kLotLevels || x < 0 || y < 0 || x >= W || y >= W)
             return false;
+        // (The ground storey's roof: a staircase's part on the storey above takes the tile too: the exe,
+        // sims.c 426284-426310, build mode type 3. Ours roofed the stairwell of stairs up to an open deck.
+        // TS_ROOF_STAIRS_OLD=1: as before.)
+        if (below == 0 && level == 1 && stairs_above && size_t(x) + size_t(y) * W < stairs_above->size() &&
+            (*stairs_above)[size_t(x) + size_t(y) * W])
+            return true;
         return indoors(x, y, level) || lot.floor(x, y, level) != 0;
     }
 
@@ -58,8 +104,8 @@ struct Builder {
             return false;
         const int sx = px % kTile == kHalf ? 1 : -1, sy = py % kTile == kHalf ? 1 : -1;
         bool half = false;
-        if (!indoors(tx, ty, below)) {
-            if (!indoors(tx + sx, ty, below) && !indoors(tx, ty + sy, below) && !indoors(tx + sx, ty + sy, below))
+        if (!roofed_room(tx, ty)) {
+            if (!roofed_room(tx + sx, ty) && !roofed_room(tx, ty + sy) && !roofed_room(tx + sx, ty + sy))
                 return false;
             half = true;
         }
@@ -124,12 +170,14 @@ bool under_roof(const Lot &lot, const RoomMap (&rooms)[kLotLevels], int storey, 
     const Builder b{ lot, rooms, storey };
     return b.indoors(x, y, storey) && !b.indoors_or_floor(x, y, storey + 1);
 }
-std::vector<RoofFace> build_roof(const Lot &lot, const RoomMap (&rooms)[kLotLevels], int storey)
+std::vector<RoofFace> build_roof(const Lot &lot, const RoomMap (&rooms)[kLotLevels], int storey,
+                                 const std::vector<uint8_t> *stairs_above)
 {
     std::vector<RoofFace> faces;
     if (storey < 0 || storey >= kLotLevels)
         return faces;
-    Builder b{ lot, rooms, storey };
+    Builder b{ lot, rooms, storey, TS_ENV("TS_ROOF_STAIRS_OLD") ? nullptr : stairs_above };
+    b.find_unflat();
     const int width = W * 2;
     std::vector<bool> evaluated(size_t(width) * width, false);
     std::vector<Rect> rects;

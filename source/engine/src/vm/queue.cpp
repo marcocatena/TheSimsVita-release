@@ -182,7 +182,7 @@ void Thread::cancel(uint16_t uid)
     }
 }
 
-bool Thread::check(const QueuedAction &a, std::map<int, int16_t> *ads, const TtabInteraction *ia)
+bool Thread::check(const QueuedAction &a, std::map<int, int16_t> *ads, const TtabInteraction *ia, bool on_its_own)
 {
     if (ads)
         ads->clear();
@@ -217,7 +217,21 @@ bool Thread::check(const QueuedAction &a, std::map<int, int16_t> *ads, const Tta
     const TtabInteraction *saved_source = ad_source;
     ad_changes.clear();
     ad_source = ia;
-    const bool ok = run_now(frame_for(vm_, entity_, a, a.check)) == Exit::ReturnTrue;
+    // The check has parameters of its own: 0 = "on its own" (1 from free will, 0 else), the rest 0 (the
+    // exe's FUN_0060b110, sims.c 408097-408104 and 408170); the order's parameters are the action's alone
+    // (386140). Ours ran the check with the order's, so one that opens "param 0 == 0, else false" refused
+    // an order carrying a menu entry's object there: "Give Gift.../Red Roses" (PersonGlobals 8457) and
+    // the seats' "Menu" (8458: Cuddle, then Caress, Embrace, Kiss) vanished as they started, since the
+    // 2026-11-18 change that runs a run-immediately entry's check then (the Hot Date audit, 2026-11-20).
+    // TS_CHECK_ARGS_OLD=1: the order's, as before.
+    static const bool check_args_old = TS_ENV("TS_CHECK_ARGS_OLD") != nullptr;
+    Frame check_frame = frame_for(vm_, entity_, a, a.check);
+    if (!check_args_old) {
+        const bool own = on_its_own;
+        check_frame.args.assign(std::max<size_t>(check_frame.args.size(), 4), 0);
+        check_frame.args[0] = own ? 1 : 0;
+    }
+    const bool ok = run_now(std::move(check_frame)) == Exit::ReturnTrue;
     if (ads)
         ads->swap(ad_changes);   // (ads was emptied above: handed over, not copied)
     ad_changes = std::move(saved_changes);
@@ -338,6 +352,15 @@ void Thread::run_immediately()
         queue.erase(it);
         if (!a.action)
             return;
+        // Its check first, and nothing run if that says no: the exe's FUN_005f01f0 calls FUN_0060b110 (the
+        // check tree) before the action (sims.c 386130-386134). Vacation's hotel counts its nights in such
+        // checks ("Auto-Checkin TEST" takes a key off each guest, "One-hour Warning TEST" picks its hour):
+        // skipped, the keys never ran out, the hotel was free after the first night, and every family, room
+        // or none, was told at 11:00 it had missed its check-out (the Vacation audit, 2026-11-18).
+        // TS_IMMEDIATE_CHECK_OLD=1.
+        static const bool check_old = TS_ENV("TS_IMMEDIATE_CHECK_OLD") != nullptr;
+        if (!check_old && a.check && !check(a))
+            return;
         Frame f = frame_for(vm_, entity_, a, a.action);
         f.action_tree = true;
         f.discard_result = true;
@@ -375,6 +398,97 @@ const Ttab *Vm::ttab(const LoadedIff *file, uint16_t id)
     return (tables_[key] = std::move(t)).get();
 }
 
+// "All stereo stations" (Gameplay modifiers, the user's 2026-11-18, after the community's "All Stereo
+// Stations" mod; not the original's). The base game's stereos (Stereos.iff), the dorm stereo and
+// Superstar's play all nine stations (their "set sound by state", the lot's station in global 31) but
+// offer only their own four; House Party's five (Country Dance, Rap, Techno, Disco, Beach) are on the
+// jukebox's menu alone. The mod copies the jukebox's five tests and actions into the stereos' files and
+// adds five entries to their tables; here the stereo's table gets copies of the jukebox's own five
+// entries, their routines the jukebox's run as the stereo's (Vm::routine: ids 4160-4169, free in those
+// files), their names the jukebox's (Entity::action).
+static bool stereo_file(const ObjectInfo &info)
+{
+    std::string w = info.where;
+    for (char &c : w)
+        c = char(std::tolower(uint8_t(c)));
+    for (const char *f : { ":stereos.iff", ":dormstereo.iff", ":stereosuperstar.iff" })
+        if (w.size() >= std::strlen(f) && w.compare(w.size() - std::strlen(f), std::strlen(f), f) == 0)
+            return true;
+    return false;
+}
+
+const Ttab *Vm::stations_table(const Entity &e)
+{
+    if (!e.info || !e.tree_table || !stereo_file(*e.info))
+        return nullptr;
+    const Ttab *base = e.tree_table;
+    for (const auto &[own, with] : station_tables_)
+        if (with.get() == base)
+            return base;   // (has them already)
+    if (auto it = station_tables_.find(base); it != station_tables_.end())
+        return it->second.get();
+    const FileRef *ref = content.file("JukeBox.iff");
+    const LoadedIff *jukebox = ref ? content.load(*ref) : nullptr;
+    if (!jukebox)
+        return nullptr;
+    // The jukebox's entries for stations 4-8, by their actions ("Interaction - Switch to Country Dance"
+    // 4124, Rap 4140, Techno 4125, Disco 4115, Beach 4139).
+    static const uint16_t kActions[5] = { 4124, 4140, 4125, 4115, 4139 };
+    auto with = std::make_unique<Ttab>(*base);
+    int found = 0;
+    for (const IffChunk &c : jukebox->iff.chunks) {
+        if (std::strcmp(c.type, "TTAB") != 0)
+            continue;
+        const Ttab *theirs = ttab(jukebox, c.id);
+        const StringTable *names = string_table(jukebox, "TTAs", c.id);
+        if (!theirs)
+            continue;
+        for (int k = 0; k < 5; k++)
+            for (const TtabInteraction &ia : theirs->interactions)
+                if (ia.action == kActions[k] && station_routines_[2 * k + 1] == 0) {
+                    station_routines_[2 * k] = ia.test;
+                    station_routines_[2 * k + 1] = ia.action;
+                    if (const std::string *s = names ? names->get(ia.tta_index) : nullptr)
+                        station_names_[k] = *s;
+                    break;
+                }
+        for (int k = 0; k < 5; k++)
+            for (const TtabInteraction &ia : theirs->interactions)
+                if (ia.action == kActions[k]) {
+                    TtabInteraction mine = ia;
+                    mine.test = uint16_t(4160 + 2 * k);
+                    mine.action = uint16_t(4161 + 2 * k);
+                    mine.tta_index = kStationEntry + uint32_t(k);
+                    with->interactions.push_back(mine);
+                    found++;
+                    break;
+                }
+        if (found)
+            break;
+    }
+    if (!found)
+        return nullptr;
+    return (station_tables_[base] = std::move(with)).get();
+}
+
+void Vm::apply_stations()
+{
+    stations_applied_ = all_stations;
+    for (const auto &up : entities) {
+        Entity &e = *up;
+        if (e.dead || !e.tree_table)
+            continue;
+        if (all_stations) {
+            if (const Ttab *t = stations_table(e))
+                e.tree_table = t;
+        } else {
+            for (const auto &[own, with] : station_tables_)
+                if (with.get() == e.tree_table)
+                    e.tree_table = own;
+        }
+    }
+}
+
 bool Entity::action(Vm &vm, int number, int16_t stack, QueuedAction &out)
 {
     if (!tree_table)
@@ -404,7 +518,9 @@ bool Entity::action(Vm &vm, int number, int16_t stack, QueuedAction &out)
     out.flags = found->flags;
     out.args.assign(4, 0);
     // The name, from the TTAs strings beside the table.
-    if (const StringTable *names = vm.string_table(tree_file, "TTAs", tree_table_id))
+    if (const std::string *station = vm.station_name(found->tta_index))   // (all_stations: the jukebox's entry)
+        out.name.assign(*station);
+    else if (const StringTable *names = vm.string_table(tree_file, "TTAs", tree_table_id))
         if (const std::string *s = names->get(found->tta_index))
             out.name.assign(*s);
     return out.action != nullptr;
@@ -491,10 +607,15 @@ bool Vm::visitor_refused(const Entity &sim, uint32_t flags, const Entity *object
     if (object && hood && sim.person_data.size() > 31) {
         const int16_t category = object->value(VarCategory);
         if (category == 4 || category == 7)
-            if (const Neighbor *n = hood->by_id(sim.person_data[31]))
-                for (const Token &t : n->tokens)
+            if (const Neighbor *n = hood->by_id(sim.person_data[31])) {
+                // (The Sim's own tokens: the neighbour's record has them only from the next save, so a
+                // guest just checked in found the beds shut, up to a game hour in the viewer and for good
+                // in run_vm: the Vacation audit, 2026-11-18. TS_KEY_RECORD_OLD=1: the record's.)
+                static const bool record_old = TS_ENV("TS_KEY_RECORD_OLD") != nullptr;
+                for (const Token &t : record_old ? n->tokens : sim.tokens)
                     if (t.kind == 0 && t.guid == 0x3AC022D6u && t.count > 0)
                         return false;
+            }
     }
     return true;
 }
@@ -574,6 +695,10 @@ std::vector<Vm::MenuEntry> Vm::pie_menu(Entity &sim, Entity &obj)
     std::vector<MenuEntry> out;
     if (!obj.tree_table || !sim.thread)
         return out;
+    // A pet the player has selected is not theirs to order: the exe builds its menu for the floor's Destination
+    // marker (GUID 0x7C4, Go Here) alone (FUN_0060ad10, sims.c 407893-407898). TS_PET_CONTROL=1: as any Sim.
+    if (pet_kind(sim) && !TS_ENV("TS_PET_CONTROL") && !(obj.info && obj.info->guid == 0x7C4))
+        return out;
     static const bool why = TS_ENV("TS_MENU_WHY") != nullptr;   // debug: why each is left out
     for (const TtabInteraction &ia : obj.tree_table->interactions) {
         if (!allowed(sim, ia, false, &obj)) {
@@ -593,6 +718,7 @@ std::vector<Vm::MenuEntry> Vm::pie_menu(Entity &sim, Entity &obj)
         }
         std::vector<std::pair<std::string, int16_t>> named;   // what the check tree calls its entries
         sim.thread->action_strings = &named;
+        sim.thread->check_wrote_stack = false;
         sim.set_value(VarHideInteraction, 0);
         const bool ok = (debug_menu && (ia.flags & TtabDebug)) || sim.thread->check(a);   // (tests: a debug one shown whatever its check says)
         sim.thread->action_strings = nullptr;
@@ -620,9 +746,22 @@ std::vector<Vm::MenuEntry> Vm::pie_menu(Entity &sim, Entity &obj)
         }
         // One entry each ("Call..." on a phone: Go Downtown, Vacation, ... one per plugin),
         // under the interaction's own name when it opens a submenu.
+        // An entry named for another object (the stack object as the check named it: a phone's plugin) carries
+        // that object in parameter 0. One the check only renamed, the object's own, carries nothing: its check
+        // and action then see parameter 0 as the engine leaves it, 0. Ours passed the object's own number too,
+        // and a check that reads parameter 0 for something else refused the order as it came up: the slot
+        // machine's "Bet $100 TEST" (slotmachine.iff 4100: "param 0 == 0", else false; "Bet $10 TEST" only asks
+        // whether it is 1): "I'm selecting to bet 100 on the slot machine but the action is immediately
+        // cancelled ... lisa will bet 10" (the user, 2026-11-18). TS_MENU_PARAM_OLD=1: as before.
+        static const bool param_old = TS_ENV("TS_MENU_PARAM_OLD") != nullptr;
+        // (Which is which: change_action_string, by whether the check wrote the stack object.)
+        (void)param_old;
+        // A name that is a path already ("Add.../Toad Sweat" on the wand charger, the charm makers and the
+        // nectar press) isn't put under the interaction's own again: it read "Add.../Add.../Toad Sweat"
+        // (the Makin' Magic audit, 2026-11-18).
         const bool submenu = a.name.size() > 3 && a.name.compare(a.name.size() - 3, 3, "...") == 0;
         for (const auto &[name, param] : named)
-            out.push_back({ submenu ? a.name + "/" + name : name, int(ia.tta_index), param });
+            out.push_back({ submenu && name.find('/') == std::string::npos ? a.name + "/" + name : name, int(ia.tta_index), param });
     }
     return out;
 }

@@ -8,6 +8,7 @@
  * Events/HITTVOn.cs; tso.content/TS1/TS1Audio.cs).
  */
 #include "core/env.h"
+#include "core/strings.h"
 #include "core/memory_kind.h"
 #include "audio/hit.h"
 
@@ -84,6 +85,8 @@ struct Track {
     int volume = 1024;
     int duck = 0;    // ducking priority (variable 0x19)
     int group = 1;   // control group: 1 sound effects, 2 music, 3 voices
+    int spl = 20;    // sound level class (the line's "level": kSplInfinite 0, kSplLoud 10, kSplNormal 20, kSplStereo 10001)
+    int args = 2;    // argument kind (kArgsNormal 0, kArgsVolPan 1, kArgsIdVolPan 2, kArgsXYZ 3)
     uint32_t hitlist = 0, sound = 0;
 };
 
@@ -248,8 +251,20 @@ void read_hot(const std::string &text, ResGroup &g, size_t index, std::map<std::
             t.volume = eme(f[2]);
         if (f.size() > 4)
             t.duck = eme(f[4]);
+        if (f.size() > 3 && !f[3].empty()) {
+            const std::string a = lower(f[3]);
+            t.args = a == "kargsidvolpan" ? 2 : a == "kargsnormal" || a == "kargsnone" ? 0 : a == "kargsvolpan" ? 1 : a == "kargsxyz" ? 3
+                     : std::isdigit(uint8_t(a[0])) ? std::atoi(a.c_str()) : 2;
+        }
+        if (f.size() > 6 && !f[6].empty()) {
+            const std::string l = lower(f[6]);
+            t.spl = l == "ksplinfinite" || l == "ksplnone" ? 0 : l == "ksplloud" ? 10 : l == "ksplnormal" ? 20 : l == "ksplstereo" ? 10001
+                    : std::isdigit(uint8_t(l[0])) ? std::atoi(l.c_str()) : 20;
+        }
         if (f.size() > 5)
-            t.group = f[5] == "kGroupMusic" ? 2 : f[5] == "kGroupVox" ? 3 : 1;
+            // (By name in the base game's tables, by number in every pack's: 1 effects, 2 music, 3 voices. The
+            // packs' 2,300 voice tracks were taken for effects: under the effects' volume, not the voices'.)
+            t.group = f[5] == "kGroupMusic" || f[5] == "GroupMusic" || f[5] == "2" ? 2 : f[5] == "kGroupVox" || f[5] == "3" ? 3 : 1;
         if (f.size() > 7 && f[7].size() > 1)
             t.hitlist = uint32_t(hsm(f[7].substr(1)));   // the label's value (case as the hsm has it, folded)
         if (f.size() > 8)
@@ -291,6 +306,7 @@ struct Engine::Thread {
     std::vector<uint32_t> stack;
     float volume = 1;
     int group = kFx;
+    std::vector<uint16_t> also;   // other objects playing this track, sharing this voice (Engine::sharers)
     // A station.
     bool station = false, music = false;
     std::vector<std::string> files;
@@ -402,9 +418,8 @@ struct Engine::Thread {
     void write_own(int at, int v)
     {
         if (at == kPatch) {   // switches what plays
-            auto it = g->patches.find(uint32_t(v));
-            if (it != g->patches.end())
-                patch = &it->second;
+            if (const Patch *p = patch_of(uint32_t(v)))
+                patch = p;
         } else if (at == kTarget) {
             target = 0;
             for (auto &t : e.threads_)
@@ -454,6 +469,20 @@ struct Engine::Thread {
         }
     }
     uint32_t choose() { return hitlist->choose(e.random_); }
+    // A patch by its number: this table's, else another's. The numbers are the whole game's (the base tables' 1-6000,
+    // each pack's own range), and a pack's hit list names the base game's clips beside its own: Hot Date's
+    // conversation lists (65813, 65814) hold 1053-1058 and 4231-4236 of SimsGeneratedHitSource, gnome.hot's every
+    // list xpack.hot's patches. Looked up in the thread's table alone, those entries played the track's own first
+    // sound instead (the maitre d's voice in a conversation).
+    const Patch *patch_of(uint32_t id) const
+    {
+        if (auto it = g->patches.find(id); it != g->patches.end())
+            return &it->second;
+        for (auto other = e.data_->groups.rbegin(); other != e.data_->groups.rend(); ++other)
+            if (auto it = other->patches.find(id); it != other->patches.end())
+                return &it->second;
+        return nullptr;
+    }
     void set_track(uint32_t id)
     {
         track_id = id;
@@ -472,12 +501,11 @@ struct Engine::Thread {
             track = Track();
             track.sound = id;
         }
-        auto p = g->patches.find(track.sound);
-        patch = p == g->patches.end() ? nullptr : &p->second;
+        patch = patch_of(track.sound);
         if (TS_ENV("HIT_TRACE"))   // debug: how each event's track resolved
-            std::printf("  hit %s track %u: hitlist %u, sound %u, subroutine %s, patch %s\n", name.c_str(), unsigned(id),
-                        unsigned(track.hitlist), unsigned(track.sound), track.subroutine ? "yes" : "no",
-                        patch ? patch->file.c_str() : "-");
+            std::printf("  hit %s track %u: hitlist %u, sound %u, subroutine %s, patch %s, level class %d, args %d\n", name.c_str(),
+                        unsigned(id), unsigned(track.hitlist), unsigned(track.sound), track.subroutine ? "yes" : "no",
+                        patch ? patch->file.c_str() : "-", track.spl, track.args);
         mix();
         group = track.group == 2 ? kMusic : track.group == 3 ? kVox : kFx;
     }
@@ -488,6 +516,7 @@ struct Engine::Thread {
         const uint32_t h = e.out_.note(patch->file, source, looped || patch->looped, volume, group);
         if (!h)
             return -1;
+        e.out_.note_class(h, track.spl, track.args);
         notes.push_back(h);
         return int(notes.size()) - 1;
     }
@@ -831,6 +860,8 @@ struct Engine::Thread {
             next = 0;
         }
         playing_stream = e.out_.stream(files[next++], source, volume, group);
+        if (playing_stream)
+            e.out_.note_class(playing_stream, track.spl, 2);   // (placed by its object, in its class)
         return playing_stream != 0;
     }
 
@@ -903,7 +934,46 @@ Engine::Engine(Content &content, Output &out) : data_(std::make_unique<Data>()),
 {
     MemScope scope(MemKind::Index);   // (the sound programs' banks, kept for good: counted with the index on the Vita)
     data_->root = content.root();
-    const std::vector<std::string> hots = content.names_ending(".hot");   // SoundData's and each expansion's
+    std::vector<std::string> hots = content.names_ending(".hot");   // SoundData's and each expansion's
+    // In the game's order: SoundData's first, then each pack's folder as the exe names them (FUN_00526670's calls:
+    // ExpansionPack, 2, 3, 4, Deluxe, 5, 6, 7, ExpansionShared), then the rest (objects' own); an event named in two
+    // tables is the later table's (FUN_005fe0d0 takes the earlier out). They were read by name alone, and the base
+    // game's "vox_converse_high_lead" (six clips a voice) took Hot Date's place (its own track, with the clips it
+    // added): the restaurants' talk was the same few clips over and over (the user, 2026-11-17). Five events differ
+    // so: vox_converse_high, _high_lead, _med, vox_raspberry, newspaper_look_job_vox.
+    {
+        static const char *const kOrder[] = { "sounddata/",      "expansionpack/",  "expansionpack2/", "expansionpack3/",
+                                              "expansionpack4/", "deluxe/",         "expansionpack5/", "expansionpack6/",
+                                              "expansionpack7/", "expansionshared/" };
+        const std::string root = fold_path(content.root());
+        auto rank = [&](const std::string &hot) {
+            const FileRef *ref = content.file(hot);
+            if (!ref)
+                return int(std::size(kOrder));
+            std::string path = fold_path(ref->path);
+            for (char &c : path)
+                if (c == '\\')
+                    c = '/';
+            std::string under = root;
+            for (char &c : under)
+                if (c == '\\')
+                    c = '/';
+            if (!under.empty() && under.back() != '/')
+                under += '/';
+            if (path.compare(0, under.size(), under) == 0)
+                path.erase(0, under.size());
+            for (size_t k = 0; k < std::size(kOrder); k++)
+                if (path.compare(0, std::strlen(kOrder[k]), kOrder[k]) == 0)
+                    return int(k);
+            return int(std::size(kOrder));
+        };
+        std::vector<std::pair<int, std::string>> ranked;
+        for (const std::string &hot : hots)
+            ranked.emplace_back(rank(hot), hot);
+        std::stable_sort(ranked.begin(), ranked.end());   // (within a folder by name, as they were)
+        for (size_t i = 0; i < hots.size(); i++)
+            hots[i] = ranked[i].second;
+    }
     data_->groups.reserve(hots.size() + kAddedTables);
     for (const std::string &hot : hots)
         add_table(content, hot);
@@ -1064,6 +1134,12 @@ Engine::Thread *Engine::start(const std::string &event, uint16_t source, bool lo
         thread->files = station_files(data_->root, st->second, random_);
         thread->volume = 0.8f;
         thread->group = kMusic;
+        // (A station is a track too: its own volume, 900 a radio's and 750 the TV's of 1024, and its sound
+        // level class, a stereo's or the TV's "loud": the exe places it by them. TS_SOUND_LAW_OLD=1: 0.8.)
+        if (auto tr = g.tracks.find(ev.track); tr != g.tracks.end() && !TS_ENV("TS_SOUND_LAW_OLD")) {
+            thread->track.spl = tr->second.spl;
+            thread->volume = std::clamp(float(tr->second.volume) / 1024.0f, 0.0f, 1.0f);
+        }
         if (thread->files.empty())
             return nullptr;
     } else if (ev.type == kSoundobPlay || ev.type == kPlayPiano) {
@@ -1101,6 +1177,26 @@ Engine::Thread *Engine::start(const std::string &event, uint16_t source, bool lo
     return threads_.back().get();
 }
 
+bool Engine::play_track(uint32_t track, uint16_t source, bool loop)
+{
+    const std::string key = "track#" + std::to_string(track);
+    if (!data_->events.count(key)) {
+        for (size_t i = 0; i < data_->groups.size(); i++)
+            if (data_->groups[i].tracks.count(track)) {
+                Event ev;
+                ev.type = kSoundobPlay;
+                ev.track = track;
+                ev.group = i;
+                data_->events[key] = ev;
+                break;
+            }
+        if (!data_->events.count(key))
+            return false;
+    }
+    static const int no_vars[29] = {};
+    return play(key, source, no_vars, loop);
+}
+
 bool Engine::play(const std::string &event, uint16_t source, const int vars[29], bool loop)
 {
     const std::string key = lower(event);
@@ -1123,6 +1219,26 @@ bool Engine::play(const std::string &event, uint16_t source, const int vars[29],
                 return true;
         active_.erase(a);
     }
+    // One voice a track (the exe: the event's track id finds the track's one voice, FUN_00602150; an object
+    // playing it while it sounds is added to its objects, FUN_005fc6d0, and it is placed by them all,
+    // FUN_005fdf20; a voice that has ended forgets its objects, FUN_00603320). Ours started a voice an object:
+    // two Sims at the same thing sounded it twice, twice as loud. Whether the exe also starts the voice over
+    // for the newcomer (its +0x5c call) isn't known: ours carries on. TS_ONE_VOICE_OLD=1: a voice an object.
+    static const bool one_voice_old = TS_ENV("TS_ONE_VOICE_OLD") != nullptr;
+    if (type == kSoundobPlay && !one_voice_old) {
+        const Event &ev = data_->events[key];
+        if (ev.track)
+            for (auto &t : threads_)
+                if (!t->dead && !t->station && !t->music && t->track_id == ev.track && t->g == &data_->groups[ev.group]) {
+                    if (source && t->source != source && std::find(t->also.begin(), t->also.end(), source) == t->also.end())
+                        t->also.push_back(source);
+                    if (TS_ENV("HIT_TRACE"))   // debug
+                        std::printf("  hit join %s#%u: track %u's voice (#%u's), %zu sharing\n", key.c_str(), unsigned(source),
+                                    unsigned(ev.track), unsigned(t->source), t->also.size());
+                    active_[active] = t.get();
+                    return true;
+                }
+    }
     if (type == kTurnOnTV)   // one station an object
         for (auto &t : threads_)
             if (t->station && !t->music && t->source == source)
@@ -1136,10 +1252,21 @@ bool Engine::play(const std::string &event, uint16_t source, const int vars[29],
     return true;
 }
 
+std::vector<uint16_t> Engine::sharers(uint16_t source) const
+{
+    std::vector<uint16_t> out;
+    for (const auto &t : threads_)
+        if (!t->dead && t->source == source)
+            for (uint16_t s : t->also)
+                if (std::find(out.begin(), out.end(), s) == out.end())
+                    out.push_back(s);
+    return out;
+}
+
 void Engine::stop(uint16_t source)
 {
     for (auto &t : threads_)
-        if (t->source == source && !t->music) {
+        if ((t->source == source || std::find(t->also.begin(), t->also.end(), source) != t->also.end()) && !t->music) {
             if (TS_ENV("HIT_TRACE"))   // debug
                 std::printf("  hit stop %s#%u\n", t->name.c_str(), unsigned(source));
             t->stop();

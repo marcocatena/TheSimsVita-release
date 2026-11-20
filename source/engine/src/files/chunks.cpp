@@ -10,6 +10,8 @@
 #include "core/bytes.h"
 #include "core/field_reader.h"
 
+#include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <optional>
 
@@ -37,9 +39,32 @@ uint32_t rgb(uint8_t r, uint8_t g, uint8_t b)
 
 // ---------------------------------------------------------------- strings
 
+namespace {
+uint8_t g_text_language = 1;
+} // namespace
+
+void set_text_language(uint8_t language)
+{
+    g_text_language = language == 0 ? 1 : language;
+}
+
+uint8_t text_language()
+{
+    return g_text_language;
+}
+
+const std::string *StringTable::get_english(size_t index) const
+{
+    size_t n = 0;
+    for (const StringItem &it : items)
+        if (it.language == 1 && n++ == index)
+            return &it.value;
+    return nullptr;
+}
+
 const std::string *StringTable::get(size_t index, uint8_t language) const
 {
-    if (indexed && language == 1)   // (English, or a language with none falls to it: the same)
+    if (indexed && language == 1)   // (the shown language, or English where it has none)
         return index < english.size() ? &items[english[index]].value : nullptr;
     for (uint8_t lang : { language, uint8_t(1) }) {
         size_t n = 0;
@@ -61,15 +86,108 @@ bool is_string_chunk(const char *type)
            std::strcmp(type, "FAMs") == 0;
 }
 
+// Strings that are the game's data, not words to show: numbers ("1, 480, 84": a lot's place on the
+// neighbourhood's map), names of animations, suits and files ("a2o-idle-neutral",
+// "b001fafat_01,BODY=b001fafatlgt_01", "terrafina.flr"). Maxis kept only English (US)'s up to date:
+// the other languages' places in such tables hold leftovers (LotLocations.iff's are hashes and old
+// places: the neighbourhood drawn in English (UK) had its houses all over, the user's Vita,
+// 2026-11-16; the pets' and Makin' Magic's animation and suit tables other animations and suits,
+// the spells' ingredients other numbers; Build.iff's prices older prices), so they are read in
+// English whatever the language shown. Scratchpad str_audit3.py over the install's 8,662 tables:
+// 100 tables of data with leftovers, none of words taken for data but UIText STR# 148's two.
+static bool numbers_only(const std::string &s)   // digits with spaces, commas and minus signs
+{
+    bool digit = false;
+    for (unsigned char c : s) {
+        if (c >= '0' && c <= '9')
+            digit = true;
+        else if (c != ' ' && c != ',' && c != '-')
+            return false;
+    }
+    return digit;
+}
+
+static bool data_string(const std::string &s)
+{
+    if (s.empty())
+        return false;
+    if (numbers_only(s))
+        return true;
+    {   // a number, a comma and more ("61, community": LotZoning.iff's lots)
+        size_t i = 0;
+        while (i < s.size() && s[i] >= '0' && s[i] <= '9')
+            i++;
+        while (i > 0 && i < s.size() && s[i] == ' ')
+            i++;
+        if (i > 0 && i < s.size() && s[i] == ',')
+            return true;
+    }
+    bool mark = false;   // a digit, '_' or '=': not in a word of any language's
+    for (unsigned char c : s) {
+        const bool letter = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+        const bool digit = c >= '0' && c <= '9';
+        if (!letter && !digit && !std::strchr("_-.,=;:#", c))
+            return false;   // (a space too: words)
+        mark = mark || digit || c == '_' || c == '=';
+    }
+    if (mark)
+        return true;
+    const size_t n = s.size();   // a file's name: ".flr"
+    return n > 4 && s[n - 4] == '.' && std::isalnum(static_cast<unsigned char>(s[n - 3])) &&
+           std::isalnum(static_cast<unsigned char>(s[n - 2])) && std::isalnum(static_cast<unsigned char>(s[n - 1]));
+}
+
+// A table of data: six in ten of English's strings are, or three in ten of four or more with
+// hardly a string of several words among them (a suit table's "adult", "lgt" beside its suits).
+static bool data_table(const std::vector<StringItem> &items, const std::vector<uint32_t> &english)
+{
+    int full = 0, data = 0, spaced = 0;
+    for (uint32_t at : english) {
+        const std::string &v = items[at].value;
+        if (v.empty())
+            continue;
+        full++;
+        if (data_string(v))
+            data++;
+        else if (v.find(' ') != std::string::npos)
+            spaced++;
+    }
+    if (!full)
+        return false;
+    return data * 10 >= full * 6 || (full >= 4 && data * 10 >= full * 3 && spaced * 10 < full);
+}
+
+// The shown language's places in a table's items: for each of English (US)'s strings, the shown
+// language's string of that index where it has a non-empty one, else English's own. Data stays
+// English's (above): a table of it whole, a number anywhere. TS_STR_DATA_OLD=1: as before.
+static std::vector<uint32_t> shown_places(const std::vector<StringItem> &items)
+{
+    std::vector<uint32_t> english, own;
+    const uint8_t lang = g_text_language;
+    for (size_t i = 0; i < items.size(); i++) {
+        if (items[i].language == 1)
+            english.push_back(uint32_t(i));
+        else if (lang != 1 && items[i].language == lang)
+            own.push_back(uint32_t(i));
+    }
+    if (own.empty())
+        return english;
+    static const bool data_old = std::getenv("TS_STR_DATA_OLD") != nullptr;
+    if (!data_old && data_table(items, english))
+        return english;
+    for (size_t i = 0; i < english.size() && i < own.size(); i++)
+        if (!items[own[i]].value.empty() && (data_old || !numbers_only(items[english[i]].value)))
+            english[i] = own[i];
+    return english;
+}
+
 bool shrink_str_chunk(const uint8_t *data, size_t size, std::vector<uint8_t> &out)
 {
     StringTable table;
     std::string err;
     if (!parse_str(data, size, table, err) || (table.format != -3 && table.format != -4))
         return false;
-    size_t kept = 0;
-    for (const StringItem &it : table.items)
-        kept += it.language == 1 ? 1 : 0;
+    const size_t kept = table.english.size();
     if (kept == table.items.size() || kept > 0xffff)
         return false;
     out.clear();
@@ -80,9 +198,8 @@ bool shrink_str_chunk(const uint8_t *data, size_t size, std::vector<uint8_t> &ou
     };
     put16(-3);
     put16(int(kept));
-    for (const StringItem &it : table.items) {
-        if (it.language != 1)
-            continue;
+    for (uint32_t place : table.english) {   // (the shown language's, parse_str: marked English)
+        const StringItem &it = table.items[place];
         out.push_back(1);
         out.insert(out.end(), it.value.begin(), it.value.end());
         out.push_back(0);
@@ -97,9 +214,7 @@ bool parse_str(const uint8_t *data, size_t size, StringTable &out, std::string &
     out.english.clear();
     out.indexed = false;
     const bool ok = parse_str_items(data, size, out, error);
-    for (size_t i = 0; i < out.items.size(); i++)
-        if (out.items[i].language == 1)
-            out.english.push_back(uint32_t(i));
+    out.english = shown_places(out.items);
     out.indexed = true;
     return ok;
 }
@@ -267,6 +382,7 @@ bool decode_spr2_frame(const Spr2Frame &f, const Palette *palette, Image &out, s
 {
     const bool has_pixels = f.flags & 1, has_z = f.flags & 2;
     const int w = f.width, h = f.height;
+    out.from_palette = true;
     out.width = w;
     out.height = h;
     out.rgba.assign(size_t(w) * h, 0);
@@ -323,6 +439,23 @@ bool decode_spr2_frame(const Spr2Frame &f, const Palette *palette, Image &out, s
                     // The water tiles spell their transparent corners out in this mode (magenta,
                     // drawn). Anywhere else the mode draws that index solid (FreeSims' note: the
                     // theatre's backdrop).
+                    // The Water Tool's tiles (floors.iff 0x800-0x80f): the byte a sprite keeps its depth in
+                    // is how much of the pixel is water or bank: 254 the water, 0 the ground outside (the
+                    // key's magenta, and the lawn painted into the corner tiles), the bank's edge graded
+                    // between. Drawn solid but for the key, a shore on sand had wedges of lawn at every
+                    // step and a bank a few pixels wide where the original's is a thin line on the sand,
+                    // its corners round (the user's lot 28 against their capture of the original,
+                    // 2026-11-18); and a bank pixel of the key's own colour (index 77, an olive) was a
+                    // hole. TS_WATER_COVER_OLD=1: the key alone.
+                    static const bool cover_old = std::getenv("TS_WATER_COVER_OLD") != nullptr;
+                    if (f.keyed && !cover_old) {
+                        if (z == 0)
+                            continue;
+                        out.rgba[row + x] = (c & 0x00ffffffu) | uint32_t(z >= 254 ? 255 : z) << 24;
+                        if (has_z)
+                            out.depth[row + x] = z;
+                        continue;
+                    }
                     if (f.keyed && index == f.transparent_index)
                         continue;
                     out.rgba[row + x] = c;
@@ -419,6 +552,7 @@ bool parse_spr(const uint8_t *data, size_t size, Spr &out, std::string &error)
 bool decode_spr_frame(const SprFrame &f, const Palette *palette, Image &out, std::string &error)
 {
     const int w = f.width, h = f.height;
+    out.from_palette = true;
     out.width = w;
     out.height = h;
     out.rgba.assign(size_t(w) * h, 0);

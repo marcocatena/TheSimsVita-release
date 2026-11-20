@@ -108,6 +108,30 @@ const CharAnimation *animation_for(Frame &f, int source, int id)
         return nullptr;
     }
     std::string name = *entry;
+    // Community fix ("Kids Shoo Raccoon Animation Fix", r/thesims1): NPCSocials.iff's child tables (STR# 130
+    // and 132) have the placeholder "18" where "Raccoon - Shoo - Person A" (4331 ip 18) wants its animation:
+    // the original's "missing animation", ours the adult's shoo on a child (the rule below). The child's own
+    // exists: c2a-goodbye-shoo. TS_RACCOON_SHOO_OLD=1.
+    static const bool shoo_old = TS_ENV("TS_RACCOON_SHOO_OLD") != nullptr;
+    if (vm.community_fixes && !shoo_old && id == 18 && name == "18" && (used == 130 || used == 132) && code.object) {
+        std::string where = code.object->where;
+        for (char &c : where)
+            c = char(std::tolower(uint8_t(c)));
+        if (where.find("npcsocials.iff") != std::string::npos)
+            name = "c2a-goodbye-shoo";
+    }
+    // "Kids make quick meals" (Vm::kids_quick_meals): the stoves' child table (Stoves.iff STR# 130) has no
+    // animations for the microwave and the toaster oven; the mod's file gives a child the toaster oven's
+    // own child pair for both: putting in and taking out (entries 10, 11 and 22) c2o-toasteroven-putfood,
+    // watching and checking (12, 13) c2o-toasteroven-foodcheck. (Without: the adult's, by the rule below.)
+    if (vm.kids_quick_meals && source == 0 && used == 130 && code.object &&
+        (id == 10 || id == 11 || id == 12 || id == 13 || id == 22)) {
+        std::string where = code.object->where;
+        for (char &c : where)
+            c = char(std::tolower(uint8_t(c)));
+        if (where.size() >= 11 && where.compare(where.size() - 11, 11, ":stoves.iff") == 0)
+            name = id == 12 || id == 13 ? "c2o-toasteroven-foodcheck" : "c2o-toasteroven-putfood";
+    }
     if ((source == 0 || source == 4) && name.find('-') == std::string::npos) {
         // A placeholder where this pairing of ages has no animation of its own ("Tickle A Loop",
         // or the entry's own number: the Grim Reaper's child table is "0" to "23"): the same entry
@@ -493,10 +517,19 @@ constexpr int kFunctionScore[] = { VarPrepValue, VarCookValue, VarSurfaceValue, 
 
 bool passes_entry_check(Frame &f, Entity &obj, int entry)
 {
+    Vm &vm = f.vm();
+    // "Kids make quick meals" (Vm::kids_quick_meals): a child cooks only in the microwave (BB626EF3) or
+    // the toaster oven (AD08FDC0), as the mod has it (its stoves' cook tests refuse a child); entry 19 is
+    // the cook function's.
+    if (entry == 19 && vm.kids_quick_meals && f.caller && f.caller->person && f.caller->person_data.size() > 58 &&
+        f.caller->person_data[58] < 18) {
+        const ObjectInfo *info = obj.master ? obj.master : obj.info;
+        if (!info || (info->guid != 0xBB626EF3u && info->guid != 0xAD08FDC0u))
+            return false;
+    }
     const uint16_t cond = obj.entry_points[size_t(entry)].condition;
     if (cond == 0)
         return true;
-    Vm &vm = f.vm();
     CodeOwner owner;
     const Routine *r = vm.routine(obj.code, cond, &owner);
     if (!r)
@@ -747,9 +780,23 @@ Exit test_sim_interacting_with(Frame &f, const uint8_t *op)
     Entity *sim = op[0] == 1 ? f.vm().entity(get(f, op[1], s16(op, 2))) : f.caller;
     if (!sim || !sim->thread)
         return Exit::GotoFalse;
-    for (const Frame &fr : sim->thread->stack)
-        if (fr.action_tree && fr.callee && fr.callee != sim && fr.callee->id == uint16_t(f.stack_id))   // (not a check tree)
-            return Exit::GotoTrue;
+    auto busy_with = [&](const std::vector<Frame> &frames) {
+        for (const Frame &fr : frames)
+            if (fr.action_tree && fr.callee && fr.callee != sim && fr.callee->id == uint16_t(f.stack_id))   // (not a check tree)
+                return true;
+        return false;
+    };
+    if (busy_with(sim->thread->stack))
+        return Exit::GotoTrue;
+    // While one of the Sim's check trees runs (a menu's test, "can join?"), its own stack is set aside
+    // (Thread::run_now): what it is doing is there. Without this the test was false in every check: the
+    // campfire's Roast Marshmallows, Tell Story and Sing never offered to a Sim sitting at it, and 27 test
+    // trees more (the House Party audit, 2026-11-20). TS_INTERACTING_CHECK_OLD=1: as before.
+    static const bool old = TS_ENV("TS_INTERACTING_CHECK_OLD") != nullptr;
+    if (!old)
+        for (const std::vector<Frame> *aside : sim->thread->aside_stacks)
+            if (busy_with(*aside))
+                return Exit::GotoTrue;
     return Exit::GotoFalse;
 }
 
@@ -1203,9 +1250,10 @@ Exit remove_object(Frame &f, const uint8_t *op)
         return Exit::GotoFalse;
     Entity *e = u16(op, 0) == 0 ? f.caller : f.stack_object();
     if (e && TS_ENV("TS_REMOVALS"))   // debug: what removes what
-        std::printf("tick %u: %s #%d removed by %s (%s)\n", unsigned(f.vm().ticks), e->info ? e->info->label.c_str() : "?",
-                    e->id, f.caller && f.caller->info ? f.caller->info->label.c_str() : "?",
-                    f.routine ? f.routine->name.c_str() : "?");
+        std::printf("tick %u: %s #%d removed by %s (%s) at (%d, %d) storey %d%s\n", unsigned(f.vm().ticks),
+                    e->info ? e->info->label.c_str() : "?", e->id, f.caller && f.caller->info ? f.caller->info->label.c_str() : "?",
+                    f.routine ? f.routine->name.c_str() : "?", e->tile_x(), e->tile_y(), int(e->level),
+                    e->in_world() ? "" : ", out of the world");
     // Another object's removal waits for the tick's end, as the exe's; the caller's own stays at
     // once (whether the exe's caller goes on with its code this tick hangs on a flag not read yet).
     // Out of the world at once, as the exe's FUN_0052bfc0 calls the object's vtable slot 0x50
@@ -1284,9 +1332,19 @@ Exit drop(Frame &f, const uint8_t *)
         return Exit::GotoFalse;
     if (wall_in_way(vm, me->tile_x(), me->tile_y(), tx, ty, me->level))
         return Exit::GotoFalse;
+    // The held object's own placement decides (the exe's FUN_00615cb0 case 5, sims.c 415796-415826: its
+    // vtable +0x54): one with no extent of its own shares a tile with what stands there, as the roach's
+    // snap above, unless both ask for the tile alone (object data 63 bit 0). Ours refused any tile with
+    // an object: the pond's toy boat (KoiPond 4103 "Play with Boat": its only Drop, onto the pond's own
+    // tile) never reached the water and the Sim steered nothing for good, every need but fun at -100
+    // (the Hot Date audit, 2026-11-20: 0 of 29 ended on all lots). TS_DROP_EXTENT_OLD=1: as before.
+    static const bool extent_old = TS_ENV("TS_DROP_EXTENT_OLD") != nullptr;
+    const bool no_extent = !extent_old && (uint16_t(held->value(VarFlags)) & FlagHasZeroExtent);
+    const bool alone = uint16_t(held->data[63]) & 1;
     for (auto &e : vm.entities)
         if (!e->dead && !e->person && e.get() != held && e->in_world() && !e->container && e->tile_x() == tx &&
-            e->tile_y() == ty && e->level == me->level && !(uint16_t(e->value(VarFlags)) & FlagHasZeroExtent))
+            e->tile_y() == ty && e->level == me->level && !(uint16_t(e->value(VarFlags)) & FlagHasZeroExtent) &&
+            (!no_extent || (alone && (uint16_t(e->data[63]) & 1))))
             return Exit::GotoFalse;
     held->set_position(int16_t(x), int16_t(y), me->level);
     return Exit::GotoTrue;
@@ -1938,11 +1996,30 @@ bool slot_spot_scored(const Entity &obj, Entity &walker, const SlotItem &slot, i
                 for (int dx = -1; dx <= 1 && !solid; dx++)
                     if (const ByTile *t = px < 0 || py < 0 ? nullptr : on_tile(px / 16 + dx, py / 16 + dy))
                         for (const Entity *e : t->objects) {
-                            if (e == &walker || e == &obj || !blocks_walking(*e) ||
-                                std::find(obj.group.begin(), obj.group.end(), e) != obj.group.end())
+                            if (e == &walker || !blocks_walking(*e))
+                                continue;
+                            // The slot's own object and its other parts count too, as any other: the exe's test of
+                            // the spot (FUN_0060e2b0 -> the walker's placement test, FUN_0053e1d0, sims.c 244347-
+                            // 244381) is given neither the walk's object nor its parts to leave out; a solid object
+                            // is stood in only where its "allow intersection" (entry 5), or the walker's, says yes
+                            // (lets_stand). Ours left them out, so "on top of" a solid object always worked: at
+                            // the pay booth (no entry 5; its init clears the wall phones' no-extent flag again) the
+                            // phones' "Common entry" (PhoneGlobals 8209) never reached its fallback, "in front of,
+                            // facing" with the poses that stand back, and the caller stood inside the hood ("when
+                            // lisa used the payphone she seems to stand too close to it", the user, 2026-11-18).
+                            // Studio Town's set pieces carry the tree (Set - Photo Shoot 4136: the Sim named in its
+                            // attribute 18; the Oxygen Bar 4116; the Music Video Set 4147) and are stood on as
+                            // before. Only for a script's "on top of" (SlotItem::on_top_of): for the SLOT tables'
+                            // own one-spot entries the same test refused the pool ladder, the toilet stalls' fronts,
+                            // the food counters and the pinball machine (the all-lots survey: 20,000 walks), where
+                            // the original's walks plainly end: our footprints there aren't the exe's yet, so those
+                            // keep the object and its parts let through. TS_ONE_SPOT_OWN_OLD=1: let through always.
+                            static const bool own_old = TS_ENV("TS_ONE_SPOT_OWN_OLD") != nullptr;
+                            const bool own = e == &obj || std::find(obj.group.begin(), obj.group.end(), e) != obj.group.end();
+                            if (own && (own_old || !slot.on_top_of))
                                 continue;
                             const Footprint fp = footprint(*e, e->x16, e->y16, e->direction);
-                            if (fp.overlaps(mine) && !fp.overlaps(now)) {
+                            if (fp.overlaps(mine) && !fp.overlaps(now) && !(own && lets_stand(*e))) {
                                 solid = e;
                                 break;
                             }
@@ -3666,6 +3743,7 @@ Exit goto_relative_walk(Frame &f, const uint8_t *op)
     slot.type = 3;
     if (location == -2) {   // on top of
         slot.min_proximity = slot.optimal_proximity = 0;
+        slot.on_top_of = true;
     } else {
         // As the original builds it (FUN_005f76e0): one tile off on that side; an odd location
         // (a corner) is the two sides beside it; anywhere near (-1, or anything else) is the
@@ -3900,8 +3978,20 @@ Exit snap(Frame &f, const uint8_t *op)
                     return Exit::GotoFalse;
                 }
         }
-        mover.place_whole(int16_t(x), int16_t(y), obj->level,
-                          face >= 0 && (slot.flags & 4096) ? face : mover.direction);
+        // A snap that doesn't turn the mover moves every part by the step, where it is: laid out afresh
+        // round the lead tile for its facing, a car its code had turned round to back up (NPCCar 4098
+        // "Arrive at Portal": me 1 += 4, then 82 snaps) flipped to the lead's other side, ended with its
+        // body off the map and never came forward: Drew Carey's limo never arrived, nor the one to take
+        // him away (the House Party audit, 2026-11-20). TS_SNAP_RELAY_OLD=1: as before.
+        static const bool relay_old = TS_ENV("TS_SNAP_RELAY_OLD") != nullptr;
+        const bool turns = face >= 0 && (slot.flags & 4096);
+        if (!relay_old && !turns && !mover.group.empty() && obj->level == mover.level) {
+            for (Entity *part : mover.group)
+                if (part->in_world())
+                    part->set_position(int16_t(part->x16 + dx), int16_t(part->y16 + dy), part->level);
+            return Exit::GotoTrue;
+        }
+        mover.place_whole(int16_t(x), int16_t(y), obj->level, turns ? face : mover.direction);
         return Exit::GotoTrue;
     }
     // A Sim doesn't snap onto something solid: the snap fails (FreeSO VMSnap's SetPosition) and the
@@ -4217,7 +4307,7 @@ std::vector<std::pair<int16_t, std::string>> pet_choices(Vm &vm, const Entity *p
         if (pen->info->guid == kCatPen)
             dog = false;
         else if (pen->info->guid != kDogPen)
-            dog = pen->info->name.find("Cat") == std::string::npos;
+            dog = (text_language() == 1 ? pen->info->name : pen->info->label).find("Cat") == std::string::npos;   // (the label: English whatever the language shown)
     }
     if (dog_out)
         *dog_out = dog;
@@ -4276,6 +4366,9 @@ std::vector<std::pair<int16_t, std::string>> travel_lots(Vm &vm, int type)
             if (zone != vm.hood->zoning.end() && zone->second == 0)
                 continue;   // somebody's home (Magic Town's 90-92), not a place to visit
             if (h >= lo && h <= hi && h != vm.house) {
+                if (type == 7 && !TS_ENV("TS_VACATION_SAVE_OLD"))
+                    if (const int16_t on = vm.hood->vacation_at(h); on != 0 && (!vm.hood->family_in_house(vm.house) || on != vm.hood->family_in_house(vm.house)->id))
+                        continue;   // (another family is on vacation there)
                 auto name = vm.hood->lot_names.find(h);
                 out.emplace_back(int16_t(h), name != vm.hood->lot_names.end() ? name->second : "Lot " + std::to_string(h));
             }
@@ -4479,11 +4572,103 @@ std::string dialog_text(Frame &f, const std::string &in)
 
 // Dialogs (private, global and semi-global strings, STR# 301): shown to the
 // player; a blocking one waits for the answer, which picks the way on.
+// The spellbook's and the cookbook's pages (dialog types 12 and 15), as the exe fills its window
+// (FUN_00494390 with FUN_004443e0 the list, FUN_004436f0 a row, FUN_00496270 the right page; read by the
+// Makin' Magic audit, 2026-11-18, private/audits/2026-11-18/makin_magic.md):
+// - which book: the cookbook, else the adults' spellbook for a Sim of age 0 or over 17, else the child's;
+// - its title, GameData/magic.iff STR# 1 [0] "%s Family Spellbook" / [1] "%s Family Cookbook";
+// - its entries: the adults' in the order of MagicMasterSpells.iff STR# 15 (22 numbers, 12 "TBD Charm"
+//   left out), a child's STR# 16 (9), the recipes 1-9 (Magic Nectar, 4, and Magic Tart, 9, only once made);
+// - an entry's three ingredients: "a,b,c" at its number in STR# 3 (adult), 4 (child), 5 (recipes), each a
+//   place in STR# 7, a GUID in hex;
+// - its title and words: magic.iff STR# 12 and 8 (adult), 13 and 9 (child), 14 and 10 (recipes); until the
+//   family has made it (Global.iff 496, "Magic - Has Made Spell/Recipe?", with the kind, 0 adult, 1 child,
+//   3 oven, 4 press, and the number) entry 0 ("Unknown Charm", "Unknown Magic") or, for the wand's spells
+//   (12 and up), 24 ("Unknown Spell"); a recipe always its own;
+// - its picture: the child's charm maker 93; the adults' 91 for charms 1-11, the wand charger 92 from 12;
+//   the nectar press 94 for recipes 1-4, the oven 90 for 5-9.
+static bool fill_book(Frame &f, Vm::Dialog &d, bool cookbook)
+{
+    Vm &vm = f.vm();
+    const FileRef *mref = vm.content.file("magic.iff"), *sref = vm.content.file("MagicMasterSpells.iff");
+    const LoadedIff *magic = mref ? vm.content.load(*mref) : nullptr, *spells = sref ? vm.content.load(*sref) : nullptr;
+    if (!magic || !spells || !f.caller)
+        return false;
+    auto text = [&](const LoadedIff *file, uint16_t table, int i) {
+        const StringTable *t = vm.string_table(file, "STR#", table);
+        const std::string *s = t && i >= 0 ? t->get(size_t(i)) : nullptr;
+        return s ? *s : std::string();
+    };
+    const int age = f.caller->person_data.size() > 58 ? f.caller->person_data[58] : 0;
+    d.book = cookbook ? 3 : (age == 0 || age > 17) ? 1 : 2;
+    d.title = text(magic, 1, cookbook ? 1 : 0);
+    if (const size_t at = d.title.find("%s"); at != std::string::npos) {
+        const Family *fam = vm.family();
+        d.title.replace(at, 2, fam ? fam->name : std::string());
+    }
+    d.book_back = text(magic, 1, 2);
+    d.book_next = text(magic, 1, 3);
+    d.book_page = text(magic, 1, 4);
+    Thread &t = *f.thread;
+    auto made = [&](int kind, int number) {   // (the game's own tree; it uses temps 0 and 1: kept)
+        CodeOwner owner;
+        const Routine *r = vm.routine(vm.global_code, 496, &owner);
+        if (!r)
+            return false;
+        const int16_t t0 = t.temps[0], t1 = t.temps[1];
+        Frame ask;
+        ask.routine = r;
+        ask.caller = f.caller;
+        ask.callee = f.callee;
+        ask.owner = owner;
+        ask.stack_id = f.stack_id;
+        ask.args = { int16_t(kind), int16_t(number), 0, 0 };
+        const bool yes = t.run_now(std::move(ask)) == Exit::ReturnTrue;
+        t.temps[0] = t0;
+        t.temps[1] = t1;
+        return yes;
+    };
+    std::vector<int> numbers;
+    if (d.book == 3) {
+        for (int n = 1; n <= 9; n++)
+            if ((n != 4 || made(4, 4)) && (n != 9 || made(3, 5)))
+                numbers.push_back(n);
+    } else {
+        const int count = d.book == 1 ? 22 : 9;
+        for (int i = 1; i <= count; i++)
+            if (const int n = std::atoi(text(spells, d.book == 1 ? 15 : 16, i).c_str()); n > 0 && !(d.book == 1 && n == 12))
+                numbers.push_back(n);
+    }
+    for (const int n : numbers) {
+        Vm::Dialog::BookEntry e;
+        const std::string recipe = text(spells, d.book == 1 ? 3 : d.book == 2 ? 4 : 5, n);
+        size_t at = 0;
+        for (int k = 0; k < 3 && at <= recipe.size(); k++) {
+            const size_t comma = std::min(recipe.find(',', at), recipe.size());
+            const int place = std::atoi(recipe.substr(at, comma - at).c_str());
+            e.ingredient[k] = uint32_t(std::strtoul(text(spells, 7, place).c_str(), nullptr, 16));
+            at = comma + 1;
+        }
+        const bool known = d.book == 3 || made(d.book == 1 ? 0 : 1, n);
+        const int shown = known ? n : d.book == 1 && n >= 12 ? 24 : 0;
+        e.title = text(magic, d.book == 1 ? 12 : d.book == 2 ? 13 : 14, shown);
+        e.words = text(magic, d.book == 1 ? 8 : d.book == 2 ? 9 : 10, shown);
+        e.picture = d.book == 2 ? 93 : d.book == 1 ? (n <= 11 ? 91 : 92) : (n <= 4 ? 94 : 90);
+        d.book_entries.push_back(std::move(e));
+    }
+    return !d.book_entries.empty();
+}
+
 Exit dialog_with(Frame &f, const uint8_t *op, const LoadedIff *file)
 {
     Vm &vm = f.vm();
     Thread &t = *f.thread;
-    const int type = op[5], flags = op[7];
+    // (The type is the byte's low seven bits, as the exe takes it: FUN_0052de90, `*(param_3 + 5) & 0x7f`.
+    // The tabloid's "Who's Hot" (Tabloid.iff 4127 ip 166) and the magic bookcase have 0x80 on a type 0:
+    // read whole it was an unknown type, answered unseen: the top ten never showed (the Superstar audit,
+    // 2026-11-18). TS_DIALOG_TYPE_OLD=1: the whole byte.)
+    static const bool type_old = TS_ENV("TS_DIALOG_TYPE_OLD") != nullptr;
+    const int type = type_old ? op[5] : op[5] & 0x7f, flags = op[7];
     if (t.dialog_waiting) {
         auto it = std::find_if(vm.dialogs.begin(), vm.dialogs.end(), [&](const Vm::Dialog &d) { return d.id == t.dialog_waiting; });
         if (it == vm.dialogs.end()) {   // gone: as if OK
@@ -4579,7 +4764,11 @@ Exit dialog_with(Frame &f, const uint8_t *op, const LoadedIff *file)
                     : lot_chooser       ? travel_lots(vm, type)
                     : transform_chooser ? transform_choices(*f.caller)
                                         : known_sims(vm, *f.caller);
-        if (d.choices.empty())
+        // The phone book with nobody in it is shown all the same, "Bob doesn't know anyone." over its empty
+        // columns, Cancel the way out (the original, Bob Newbie's Call Neighbor, captured 2026-11-20:
+        // private/og_shots/2026-11-20_phonebook). Ours went on as if refused: the Sim lifted the phone and put it
+        // down. TS_EMPTY_PHONEBOOK_OLD=1: as before.
+        if (d.choices.empty() && (type != 10 || TS_ENV("TS_EMPTY_PHONEBOOK_OLD")))
             return Exit::GotoFalse;
         // The clothes and pet choosers are pickers (the original's UIText 220 "Clothing Dialog Text"
         // and 221 "Pet Dialog Strings": one outfit or pet at a time with Previous, Next, Buy and
@@ -4628,6 +4817,29 @@ Exit dialog_with(Frame &f, const uint8_t *op, const LoadedIff *file)
                 t.temps[(flags & 32) ? 1 : 0] = d.choices[pick].first;
             return Exit::GotoTrue;
         }
+        d.blocking = true;
+        vm.dialogs.push_back(d);
+        t.dialog_waiting = d.id;
+        return Exit::ContinueNextTick;
+    }
+    // Makin' Magic's spellbook (12) and cookbook (15): the book's window, read and closed; always true, nothing
+    // handed back (the exe's cases 0xc and 0xf). Ours answered them unseen: the Sim opened the book and
+    // nothing came up (the user, 2026-11-18: "Have we implemented the family cookbook ... seems like it has
+    // its own UI"). TS_BOOK_OLD=1: unseen. (TS_BOOK_SHOW=1: shown to run_vm's `dialogs` too, as a list.)
+    if (type == 12 || type == 15) {
+        static const bool book_old = TS_ENV("TS_BOOK_OLD") != nullptr;
+        if (book_old || (vm.auto_answer && !TS_ENV("TS_BOOK_SHOW")) || !fill_book(f, d, type == 15))
+            return Exit::GotoTrue;
+        if (TS_ENV("TS_BOOK_SHOW")) {   // debug: the book's pages in words
+            std::printf("book %d \"%s\" (%s / %s / %s): %d entries\n", d.book, d.title.c_str(), d.book_back.c_str(), d.book_next.c_str(),
+                        d.book_page.c_str(), int(d.book_entries.size()));
+            for (const auto &e : d.book_entries)
+                std::printf("  %-22s picture %d, ingredients %08x %08x %08x | %.70s\n", e.title.c_str(), e.picture, unsigned(e.ingredient[0]),
+                            unsigned(e.ingredient[1]), unsigned(e.ingredient[2]), e.words.c_str());
+        }
+        if (vm.auto_answer)
+            return Exit::GotoTrue;
+        d.type = 0;
         d.blocking = true;
         vm.dialogs.push_back(d);
         t.dialog_waiting = d.id;
@@ -4698,7 +4910,22 @@ Exit make_new_character(Frame &f, const uint8_t *op)
     }
     if (op[3] != 0)
         return Exit::GotoFalse;
-    const int16_t id = f.vm().make_character(local(op[1]), local(op[2]), local(op[0]));
+    // The child keeps the name the baby was given (the cradle's, the stack object: the name box's answer).
+    // Ours passed none, so the child grew up under a name picked at random and the growing-up box named a
+    // Sim the player never named (the 2026-11-20 audit; the pet's branch above passes the pen's).
+    // TS_BABY_NAME_OLD=1: as before.
+    // A negative age: a copy of the caller (the exe's FUN_0061a3a0, sims.c 418605: the chemistry set's evil
+    // clone potion, Makin' Magic's clone charms). Ours read -1 as a child's age and the caller's id as sex
+    // and skin: a random little girl called Lucy (the Livin' Large audit, 2026-11-20). TS_CLONE_OLD=1.
+    if (local(op[1]) < 0 && f.caller && f.caller->person && !TS_ENV("TS_CLONE_OLD")) {
+        const int16_t clone = f.vm().make_clone(*f.caller);
+        if (!clone)
+            return Exit::GotoFalse;
+        f.stack_id = clone;
+        return Exit::GotoTrue;
+    }
+    const Entity *cradle = TS_ENV("TS_BABY_NAME_OLD") ? nullptr : f.stack_object();
+    const int16_t id = f.vm().make_character(local(op[1]), local(op[2]), local(op[0]), cradle ? cradle->custom_name : std::string());
     if (!id)
         return Exit::GotoFalse;
     f.stack_id = id;
@@ -5092,7 +5319,27 @@ Exit generic_call(Frame &f, const uint8_t *op)
                         e->thread->cancel(uid);
                 }
         break;
-    case 12: temps[0] = 0; break;                   // distance to the camera
+    case 12: {   // distance to the camera: minus (x + y) of the stack object's tile as the view is turned
+        // (the exe's case 0xc, sims.c 417330: the tile through the view's rotation table, on the lot's 64).
+        // Cars pick the door nearest the camera by it (47 instructions in the install); ours answered 0, so
+        // the first part always won. The turned tile from "look towards the camera" above (the camera at
+        // +x +y unturned). TS_CAMERA_DISTANCE_OLD=1: 0 as before.
+        static const bool old = std::getenv("TS_CAMERA_DISTANCE_OLD") != nullptr;
+        const Entity *so = f.stack_object();
+        if (old || !so) {
+            temps[0] = 0;
+            break;
+        }
+        int x = so->tile_x(), y = so->tile_y();
+        switch (vm.camera_rotation & 3) {
+        case 1: y = 63 - y; break;
+        case 2: x = 63 - x, y = 63 - y; break;
+        case 3: x = 63 - x; break;
+        default: break;
+        }
+        temps[0] = int16_t(-(x + y));
+        break;
+    }
     case 14: vm.set_global(31, temps[0]); break;    // the house's radio station
     case 17:   // go to the lot in temp 0 (-1: the family's home), the whole family when temp 3: FreeSO ChangeToLotInTemp0
         if (!f.caller->person || !ts::vm::start_trip(vm, *f.caller, temps[0], temps[3] != 0, temps[1], temps[2]))
@@ -5228,7 +5475,31 @@ Exit generic_call(Frame &f, const uint8_t *op)
         temps[0] = tr->transit >= 1 && fam ? int16_t(fam->id) : first ? int16_t(first->id) : -1;
         break;
     }
-    case 27: temps[0] = 9; break;   // vacation lots free (FreeSO: other families' saves don't block them yet)
+    case 27: {   // vacation lots free: nine less those a family is on vacation at (the exe's case 0x1b, sims.c
+        // 417672: each of lots 40-48 some family's record names). Ours has one family away at a time: its lot.
+        int held = 0;
+        for (int h = 40; h <= 48 && vm.hood; h++)
+            held += vm.hood->vacation_at(h) != 0 ? 1 : 0;
+        temps[0] = int16_t(TS_ENV("TS_VACATION_LOTS_OLD") ? 9 : 9 - held);
+        break;
+    }
+    case 43: {   // Makin' Magic: what the family has made, given to this lot's spell controller (the exe's case
+        // 0x2b, FUN_0057a0e0: on the family's home lot, each of the controller's attributes 0-5 raised to the
+        // family record's). A no-op in ours: a family that moved house, or came in a shared lot, had made
+        // nothing as far as the new lot's controller knew (the 2026-11-18 audit). TS_SPELLS_KEPT_OLD=1: as before.
+        Family *fam = vm.hood ? vm.hood->family_in_house(vm.house) : nullptr;
+        if (!fam || TS_ENV("TS_SPELLS_KEPT_OLD"))
+            break;
+        for (const auto &e : vm.entities)
+            if (!e->dead && e->info && e->info->guid == Vm::kSpellController) {
+                if (e->attributes.size() < 6)
+                    e->attributes.resize(6, 0);
+                for (int i = 0; i < 6; i++)
+                    e->attributes[size_t(i)] = std::max(e->attributes[size_t(i)], fam->spells[i]);
+                break;
+            }
+        break;
+    }
     case 28: {                                      // zoning of the lot numbered in temp 0
         // Downtown (21-30) and vacation (40-49) lots, which LotZoning doesn't list, are neither
         // residential (0: a Sim downtown sent themselves home as a visitor) nor community (1:
@@ -5246,8 +5517,14 @@ Exit generic_call(Frame &f, const uint8_t *op)
         temps[0] = int16_t(zone);
         break;
     }
-    case 32: break;   // create purchased pets near owner (coming home from a pet shop): a pet joined the family at the
-                      // shop (call 4) and the home's load puts every member of the family on the lot, the pet with them
+    case 32:   // create purchased pets near owner (coming home from a pet shop): every member of the family not on
+        // the lot is made beside the caller (the exe's case 0x20, sims.c 417844-417942). A no-op in ours, "the
+        // home's load puts every member on the lot": but coming home the lot is the parked one carried on, not
+        // loaded, so the pet bought at the shop was not at home until the lot was next opened from its save
+        // (the Unleashed audit, 2026-11-20). TS_PETS_HOME_OLD=1: as before.
+        if (!TS_ENV("TS_PETS_HOME_OLD"))
+            vm.restore_missing_family(f.caller);
+        break;
     case 33: {        // add the neighbour in the stack object to the family in temp 0 (a pet running away to, or joining, a family)
         if (!vm.hood)
             return Exit::GotoFalse;
@@ -5325,6 +5602,13 @@ Exit generic_call(Frame &f, const uint8_t *op)
                         int(so->id), op[0] == 34 ? "promote" : "demote", int(so->person_data[81]), int(so->person_data[80]),
                         friends_star_power(vm, so->person_data[31]));
         return changed ? Exit::GotoTrue : Exit::GotoFalse;
+    }
+    case 35: {   // the stack object (a person, else the exe's error 0x1c) is the Studio Town traveller (sims.c 417980)
+        Entity *so = f.stack_object();
+        if (!so || !so->person)
+            return Exit::Error;
+        vm.studio_traveller = so->id;
+        break;
     }
     case 42: {                                      // make the Sim in temp 0 the selected one
         Entity *e = vm.entity(temps[0]);
@@ -5542,8 +5826,16 @@ Exit change_action_string(Frame &f, const uint8_t *op)
         return Exit::GotoTrue;
     const std::string name = dialog_text(f, strings[size_t(id - 1)]);
     if (f.thread->is_check) {   // building a menu: an entry; any other check: nothing to rename
+        // The entry carries the stack object as the check has it then: another object (a phone's plugin), or
+        // a number the check put there (the wand charger's "Add.../Garlic": "so id := 4", the ingredient).
+        // One the check only renamed, the stack object still the object's own and never written, carries
+        // nothing (-1): the slot machine's "Bet $100", whose check reads parameter 0 for something else
+        // (Vm::pie_menu). Told by the number alone this morning, a charger that happened to be object 4
+        // lost its Garlic (the Makin' Magic audit, 2026-11-18). TS_MENU_PARAM_OLD=1: always the number.
+        static const bool param_old = TS_ENV("TS_MENU_PARAM_OLD") != nullptr;
+        const bool own = !param_old && !f.thread->check_wrote_stack && f.callee && f.stack_id == int16_t(f.callee->id);
         if (f.thread->action_strings)
-            f.thread->action_strings->emplace_back(name, f.stack_id);
+            f.thread->action_strings->emplace_back(name, own ? int16_t(-1) : f.stack_id);
     } else if (!f.thread->queue.empty()) {
         f.thread->queue[0].name = name;
     }
@@ -5687,7 +5979,13 @@ std::vector<AdScore> score_all(Vm &vm, Entity &sim, bool keep_failed, float min_
     std::vector<Candidate> candidates;
     for (size_t k = 0; k < vm.entities.size(); k++) {
         Entity *obj = vm.menu_owner(vm.entities[k].get(), owners_old ? nullptr : &owners);
-        if (!obj || obj == &sim || obj->dead || !obj->tree_table || !vm.on_lot(*obj) || !seen.insert(obj).second)
+        // (A Sim's own table isn't looked at, a pet's is: the exe's FUN_005f6cd0, sims.c 390859,
+        // "obj != me || 1 < person data 65". Ours skipped it for all: no dog ever dug, howled, chased its
+        // tail or asked to go out, 0 starts in 16 pet-lot-days: the Unleashed audit, 2026-11-20.
+        // TS_PET_OWN_TABLE_OLD=1: as before.)
+        static const bool pet_own_old = TS_ENV("TS_PET_OWN_TABLE_OLD") != nullptr;
+        const bool own_table_ok = !pet_own_old && sim.person_data.size() > 65 && sim.person_data[65] > 1;
+        if (!obj || (obj == &sim && !own_table_ok) || obj->dead || !obj->tree_table || !vm.on_lot(*obj) || !seen.insert(obj).second)
             continue;
         if (obj->value(VarLockoutCount) > 0)
             continue;   // locked out for a while (the fire after a failed panic), as the original skips it
@@ -5731,16 +6029,61 @@ std::vector<AdScore> score_all(Vm &vm, Entity &sim, bool keep_failed, float min_
     // their room: see Entity::action.)
     AdScore result;
     std::vector<float> passing;   // the passing ones' scores, highest first (the stopping rule)
+    // A check tree that can raise the ads it is scored by (it writes the tree's ads: scope 12, 28 or 29, itself or in
+    // what it calls, two calls deep) is run even past the stopping point: the exe runs every candidate's check
+    // (FUN_0060b110 in FUN_005f6cd0's loop, sims.c 390910), and the phone's pizza (10 becomes 50 less cooking / 50
+    // below hunger -75) or a social's "up social ad by relationship" were then never asked, 3.7% of choices picked
+    // from another set (the long-run audit, 2026-11-20). Found once an interaction. TS_AUTONOMY_RAISERS_OLD=1.
+    static const bool raisers_old = TS_ENV("TS_AUTONOMY_RAISERS_OLD") != nullptr;
+    static std::unordered_map<uint64_t, bool> raises_cache;
+    auto raises = [&](const Candidate &c) {
+        if (raisers_old || !c.obj->info)
+            return false;
+        const uint64_t key = uint64_t(c.obj->info->guid) << 16 | uint64_t(c.ia->tta_index);
+        if (auto it = raises_cache.find(key); it != raises_cache.end())
+            return it->second;
+        bool found = false;
+        QueuedAction qa;
+        if (c.obj->action(vm, int(c.ia->tta_index), int16_t(c.obj->id), qa) && qa.check) {
+            std::vector<std::pair<const Routine *, CodeOwner>> todo{ { qa.check, qa.owner } }, next;
+            for (int depth = 0; depth < 3 && !todo.empty() && !found; depth++) {
+                next.clear();
+                for (const auto &[r, own] : todo)
+                    for (const BhavInstruction &in : r->code) {
+                        if (in.opcode == 2) {
+                            const uint8_t scope = in.operand[6], oper = in.operand[5];
+                            const bool writes = oper == 3 || oper == 4 || oper == 5 || oper == 6 || oper == 7 || oper == 0x0b ||
+                                                oper == 0x0c || oper == 0x0d;
+                            if (writes && (scope == TreeAdRange || scope == TreeAdPersonalityVar || scope == TreeAdMin))
+                                found = true;
+                        }
+                        if (in.opcode >= 256 && depth < 2) {
+                            CodeOwner sub;
+                            if (const Routine *callee = vm.routine(own, in.opcode, &sub))
+                                next.push_back({ callee, sub });
+                        }
+                    }
+                todo.swap(next);
+            }
+        }
+        raises_cache[key] = found;
+        return found;
+    };
+    bool bounded = false;   // past the stopping point: only the checks that can raise their ads
     for (const Candidate &c : candidates) {
-        if (lazy) {
+        if (lazy && !bounded) {
             if (c.raw < min_score)
-                break;
+                bounded = true;
             // (Or equal: among equal scores the full run's top `count` are the first in object order,
             // and that is the order they come in here too; checking a whole tie group, a downtown
             // shop's hundreds of identical racks, ran 400-666 trees a choice for nothing.)
-            if (passing.size() >= size_t(top) && c.raw <= passing[size_t(top) - 1])
+            else if (passing.size() >= size_t(top) && c.raw <= passing[size_t(top) - 1])
+                bounded = true;
+            if (bounded && raisers_old)
                 break;
         }
+        if (bounded && !raises(c))
+            continue;
         result.score = 0;
         result.passed = false;
         result.ads.clear();
@@ -5759,7 +6102,7 @@ std::vector<AdScore> score_all(Vm &vm, Entity &sim, bool keep_failed, float min_
         result.action.args[0] = 1;
         t0 = now();
         const uint64_t i0 = vm.profile.instructions;
-        result.passed = sim.thread->check(result.action, &changes, c.ia);
+        result.passed = sim.thread->check(result.action, &changes, c.ia, true);
         result.action.args[0] = arg0;
         vm.tick_checks++;
         {   // Debug (TS_AD_STATS=1): how often a check tree changes the ads it's scored by, and passes.
@@ -5906,8 +6249,7 @@ Exit find_best_action(Frame &f, const uint8_t *)
                         chosen->action.name.c_str(), chosen->obj->info ? chosen->obj->info->label.c_str() : "?");
     }
     if (!chosen) {   // (a random number drawn only for the random pick, as the exe's)
-        vm.random_state = vm.random_state * 1103515245u + 12345u;
-        chosen = &valid[(vm.random_state >> 8) % valid.size()];
+        chosen = &valid[vm.draw() % valid.size()];
     }
     // Sitting, the choice has to be worth getting up for (the original fails the whole call).
     if (sim.person_data[0] != 0 && chosen->score < vm.global_tuning(2, "min autonomy score for sitting", 0.2f))

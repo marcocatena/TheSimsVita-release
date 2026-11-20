@@ -21,6 +21,7 @@
 #include "core/env.h"
 #include "files/iff.h"
 #include "files/install.h"
+#include "ui/lang.h"
 #include "vm/vm.h"
 #include "vm/footprint.h"
 
@@ -153,7 +154,7 @@ CatalogNames catalog_names(Content &content, int category)
         shown_at++;
     const StringTable sorts = table(150);
     if (const std::string *s = sorts.get(size_t(8 + shown_at)); s && !s->empty())
-        out.category = *s == "Seating" ? "Comfort" : *s;   // the user's word: it holds the beds too
+        out.category = category == 0 ? tr("Comfort") : *s;   // (the game's "Seating") the user's word: it holds the beds too
     const StringTable subs = table(uint16_t(200 + shown_at));
     for (int i = 0; i < 4; i++)
         if (const std::string *s = subs.get(size_t(i)))
@@ -174,8 +175,13 @@ int catalog_area(const Vm &vm)
         return 1;   // vacation
     if (h >= 81 && h <= 89)
         return 3;   // Studio Town
-    if (h >= 90 && h <= 99)
+    // (Magic Town's community lots are 93-98: the exe's catalogue mode, sims.c 4638-4665. 90-92 are Creepy
+    // Hollow's homes: the home catalogue. Ours sold the community one there: 203 home items missing, 141
+    // community-only ones offered: the 2026-11-20 audit. TS_CATALOG_CREEPY_OLD=1: as before.)
+    if (h >= 93 && h <= 98)
         return 4;   // Magic Town
+    if (h >= 90 && h <= 99 && TS_ENV("TS_CATALOG_CREEPY_OLD"))
+        return 4;
     return vm.residential() ? -1 : 2;   // a home, or an Old Town community lot
 }
 
@@ -333,8 +339,16 @@ std::string Vm::placement_problem_of(Entity *lead, int tx, int ty, int level, in
                     if (plevel == 1) {
                         if (!(place & kPlaceOnTerrain))
                             return "That goes indoors, on a floor";
+                        // The dry ring round a pool counts as floored for what can't go on floors (the exe,
+                        // sims.c 244041: error 0x13). TS_POOL_RING_OLD=1: as before.
+                        if (!(place & kPlaceOnFloor) && lot.ring_at(x, y) && !TS_ENV("TS_POOL_RING_OLD"))
+                            return "Must be placed on terrain";
                     } else if (!(place & kPlaceInAir) && level_offset(*part) == 0) {
                         return "There's no floor there";
+                    } else if (!(place & kPlaceInAir) && !TS_ENV("TS_STAIRS_FLOOR_OLD") && !floorable(x, y, plevel)) {
+                        // (The top of a flight: its landing is laid as it is placed, where a floor can go:
+                        // the exe's FUN_0056d510, errors 0x12 and 0x29. See place_held.)
+                        return "The top of the stairs needs a floor it can't have there";
                     }
                 } else if (!(place & kPlaceOnFloor) && (level_offset(*part) == 0 || !(place & kPlaceInAir))) {
                     return "That can't go on a floor";
@@ -345,7 +359,11 @@ std::string Vm::placement_problem_of(Entity *lead, int tx, int ty, int level, in
         // The ground (FreeSO SlopeValid): on a sloped tile, only what may stand on sloped ground;
         // something that goes on floors needs the flag for it. (Not checked, anything went on a
         // hillside: the 2026-10-27 report.)
-        if (plevel == 1 && tile_sloped(lot, x, y) && (place & kPlaceOnFloor) && !(place & kPlaceOnSlope))
+        // (The exe: anything without the on-slope flag, whatever its other flags, sims.c 244031: trees and
+        // flowers are terrain-only, hedges have the flag. Ours asked the on-floor flag too, FreeSO's rule:
+        // tulips and apple trees went on hillsides. TS_SLOPE_RULE_OLD=1: as before.)
+        static const bool slope_old = TS_ENV("TS_SLOPE_RULE_OLD") != nullptr;
+        if (plevel == 1 && tile_sloped(lot, x, y) && ((place & kPlaceOnFloor) || !slope_old) && !(place & kPlaceOnSlope))
             return "That can't go on a slope";
 
         // Other objects (GetObjPlace): each may let it share the tile, or carry it.
@@ -623,6 +641,14 @@ std::string Vm::movable_problem(Entity *obj, bool selling)
     obj = lead_of(obj);
     if (!obj || obj->dead)
         return "Nothing there";
+    // With move_objects on, the exe's pick-up test says yes at once, before the in-use, things-on-it and
+    // movement-flag tests (FUN_0053ee40, sims.c 244869: "if (DAT_00a67080 != 0) return 1"): a Sim, or
+    // something in use, can be lifted: how players free a stuck Sim. Ours lifted only the movement flags
+    // (the 2026-11-20 audit). Selling a Sim stays refused here. TS_MOVE_SIMS_OFF=1: as before.
+    static const bool move_sims_off = TS_ENV("TS_MOVE_SIMS_OFF") != nullptr;
+    const bool lift_all = move_objects && !move_sims_off && !selling;
+    if (lift_all)
+        return {};
     if (obj->person)
         return "That's a Sim";
     // Where it stands: not on a tile outside the lot's editable area (the exe's pick-up test FUN_0053ee40:
@@ -695,9 +721,56 @@ bool Vm::place_held(int tx, int ty, int level, int direction, std::string &why)
     why = placement_problem(tx, ty, level, direction, &onto);
     if (!why.empty())
         return false;
-    if (held.bought && held.price > budget()) {
+    // Stairs make their own stairwell (the exe's FUN_0056d510, sims.c 281917-282086): the floor is taken up
+    // under the upper parts that aren't for floors (the flight's three "hi stubs", placement 0x202), 80% of
+    // its price back, and a floor is laid and charged under an upper part that needs one and has none (the
+    // "hi pad", 0x001). Ours left the floor over the flight and the landing in the air (the 2026-11-20
+    // audit). TS_STAIRS_FLOOR_OLD=1: as before.
+    std::vector<std::array<int, 3>> stair_cut, stair_laid;   // (x, y, lot level)
+    int stair_floors_cost = 0;
+    constexpr uint16_t kLandingFloor = 1;   // (the exe: the floor tool's pattern in hand, else pattern 1)
+    if (!onto && !TS_ENV("TS_STAIRS_FLOOR_OLD")) {
+        const int dir = direction & 6;
+        int mx, my;
+        part_offset(*obj, dir, mx, my);
+        double back = 0;
+        for (Entity *part : parts_of(obj)) {
+            const int offset = level_offset(*part) - level_offset(*obj);
+            const int plevel = level + offset;
+            if (level_offset(*part) == 0 || plevel < 2 || plevel > kLotLevels)
+                continue;
+            int px, py;
+            part_offset(*part, dir, px, py);
+            const int x = tx + px - mx, y = ty + py - my, l = plevel - 1;
+            const int place = part->value(VarPlacementFlags);
+            const uint16_t floor = lot.floors[l].empty() ? uint16_t(0) : lot.floor(x, y, l);
+            if (floor != 0 && floor != kFloorPool && floor != kFloorWater && !(place & kPlaceOnFloor)) {
+                back += architecture_price(0, floor) * 0.8;
+                stair_cut.push_back({ x, y, l });
+            } else if (floor == 0 && !(place & kPlaceInAir)) {
+                stair_floors_cost += architecture_price(0, kLandingFloor);
+                stair_laid.push_back({ x, y, l });
+            }
+        }
+        stair_floors_cost -= int(0.5 + back);
+    }
+    if ((held.bought ? held.price : 0) + stair_floors_cost > budget()) {
         why = "Not enough money";
         return false;
+    }
+    for (const auto &t : stair_cut)
+        lot.floors[t[2]][size_t(t[0]) + size_t(t[1]) * kLotArraySize] = 0;
+    for (const auto &t : stair_laid) {
+        if (lot.floors[t[2]].empty())
+            lot.floors[t[2]].assign(size_t(kLotArraySize) * kLotArraySize, 0);
+        if (lot.walls[t[2]].empty())
+            lot.walls[t[2]].assign(size_t(kLotArraySize) * kLotArraySize, WallTile());
+        lot.floors[t[2]][size_t(t[0]) + size_t(t[1]) * kLotArraySize] = kLandingFloor;
+    }
+    if (!stair_cut.empty() || !stair_laid.empty()) {
+        add_money(-stair_floors_cost);
+        book(kBookArchitecture, stair_floors_cost);
+        lot_edited();
     }
     direction &= 6;
     if (onto) {
@@ -707,6 +780,13 @@ bool Vm::place_held(int tx, int ty, int level, int direction, std::string &why)
         obj->place_whole(int16_t(tx * 16 + 8), int16_t(ty * 16 + 8), int8_t(level), direction);
     }
     position_changed(*this, obj);
+    // A Sim put down by hand (move_objects) starts afresh from there: what it was doing is dropped.
+    if (obj->person && obj->thread) {
+        obj->thread->stack.clear();
+        obj->thread->queue.clear();
+        obj->thread->resting = 10;
+        obj->set_flag(FlagInteractionCanceled, false);
+    }
     for (Entity *part : parts_of(obj))
         part->run_entry(*this, 11, true);   // User Placement
     if (architectural(obj))
@@ -934,7 +1014,14 @@ void Vm::new_day()
         // ticks after his "Burglar!" (the user heard the alert and saw nobody, 2026-11-10).
         // TS_DEPRECIATE_OLD=1: as before.
         static const bool depreciate_old = TS_ENV("TS_DEPRECIATE_OLD") != nullptr;
-        const int limit = int16_t(d.get(Objd::DepreciationLimit));
+        int limit = int16_t(d.get(Objd::DepreciationLimit));
+        // Community fix ("Item Rating Fixes", r/thesims1): the Steeling Beauty Loveseat (SofaLoveSeatAOL.iff,
+        // D4588282, $139) has a depreciation limit of 578, over four times its price: in the original it is
+        // worth $578 after its first night (the exe takes the larger of the limit and the value), in ours it
+        // never lost anything. The mod's limit, 83. TS_STEEL_LOVESEAT_OLD=1.
+        static const bool loveseat_old = TS_ENV("TS_STEEL_LOVESEAT_OLD") != nullptr;
+        if (community_fixes && !loveseat_old && (e.master ? e.master : e.info)->guid == 0xD4588282u)
+            limit = 83;
         if (depreciate_old)
             e.data[VarCurrentValue] = int16_t(std::max<int>(limit, value - loss));
         else if (value > limit)
@@ -942,12 +1029,58 @@ void Vm::new_day()
     }
 }
 
+int Vm::architecture_price(int kind, uint16_t pattern) const
+{
+    static std::map<uint16_t, int> floor_price, cover_price, style_price;
+    static std::map<std::string, int> file_price;
+    static int pool_price = 75;
+    auto lower = [](std::string t) {
+        for (char &c : t)
+            c = char(std::tolower(uint8_t(c)));
+        return t;
+    };
+    if (floor_price.empty())
+        for (const BuildItem &b : build_mode_catalog(content)) {
+            if (b.kind == BuildItem::Floor && b.category == 7) {
+                if (b.pattern == kFloorPool)
+                    pool_price = b.price;
+            } else if (!b.file.empty() && (b.kind == BuildItem::Floor || b.kind == BuildItem::Wallpaper))
+                file_price[lower(b.file)] = b.price;
+            else if (b.kind == BuildItem::Floor)
+                floor_price[b.pattern] = b.price;
+            else if (b.kind == BuildItem::Wallpaper)
+                cover_price[b.pattern] = b.price;
+            else if (b.kind == BuildItem::WallStyle)
+                style_price[b.pattern] = b.price;
+        }
+    if (kind == 3)
+        return pool_price;
+    if (kind == 2) {
+        auto it = style_price.find(pattern);
+        if (it != style_price.end())
+            return it->second;
+        it = style_price.find(1);
+        return pattern == 255 && it != style_price.end() ? it->second : 0;
+    }
+    const std::map<uint16_t, int> &m = kind == 0 ? floor_price : cover_price;
+    if (const std::string *file = kind == 0 ? lot.custom_floor(pattern) : lot.custom_wall(pattern)) {
+        auto it = file_price.find(lower(*file));
+        return it == file_price.end() ? 0 : it->second;
+    }
+    auto it = m.find(pattern);
+    return it == m.end() ? 0 : it->second;
+}
+
 Vm::LotValues Vm::lot_values() const
 {
     // A pool tile: the exe's own figure (DAT_00a51898, 100), not the Pool Tool's price (build.iff STR# 133:
     // 75); water as the Water Tool. A diagonal tile's floor id, and a diagonal wall's style.
-    constexpr int kWaterTile = 15;
-    const int kPoolTile = TS_ENV("TS_OLD_ARCH_VALUE") ? 75 : 100;
+    // (2026-11-20, the build rules' audit: the exe's 100 is its static data only; at start-up the figure is
+    // overwritten with the Pool Tool's catalogue price, the variable the tool charges, sims.c 238730; and
+    // water tiles add nothing. TS_ARCH_POOL_OLD=1: 100 a pool tile and 15 a water tile, as before.)
+    static const bool pool_old = TS_ENV("TS_ARCH_POOL_OLD") != nullptr;
+    const int kWaterTile = pool_old ? 15 : 0;
+    const int kPoolTile = TS_ENV("TS_OLD_ARCH_VALUE") ? 75 : pool_old ? 100 : architecture_price(3, 0);
     constexpr uint16_t kFloorDiagonal = 255, kDiagonalStyle = 255;
     LotValues out;
     for (const auto &up : entities) {   // FUN_0052ca90

@@ -222,20 +222,43 @@ bool load_lot(const uint8_t *data, size_t size, Lot &out, std::string &error)
             }
     }
 #endif
+    // 255 is "none"; 0-15 a tile (which of its four neighbours are water too: 0 a tile on its own); 16 the
+    // dry ring round a pool. The exe takes anything under 16 as pool (FUN_00585d10) and anything but 255 as
+    // water (FUN_00585e70). Ours took 0 for "none": 18 single pool tiles (House86, House89) and 10 pond
+    // tiles (House29, 30, 74, 94) of the shipped lots were plain ground (the 2026-11-20 audit). A grid with
+    // no 255 in it at all (never written: all zeros) has none. TS_POOL_ZERO_OLD=1: as before.
+    static const bool zero_old = TS_ENV("TS_POOL_ZERO_OLD") != nullptr;
+    auto written = [&](const LotArray *a) {
+        if (!a || zero_old)
+            return false;
+        for (int y = 0; y < kLotArraySize; y++)
+            for (int x = 0; x < kLotArraySize; x++)
+                if (lot_cell(*a, x, y)[0] == 255)
+                    return true;
+        return false;
+    };
+    const bool pools_written = written(pools), water_written = written(water);
+    // The ring (16) kept as its own mark (it isn't pool or water). TS_POOL_RING_OLD=1: dropped, as before.
+    if (pools && pools_written && !TS_ENV("TS_POOL_RING_OLD")) {
+        out.pool_ring.assign(size_t(kLotArraySize) * kLotArraySize, 0);
+        for (int y = 0; y < kLotArraySize; y++)
+            for (int x = 0; x < kLotArraySize; x++)
+                if (lot_cell(*pools, x, y)[0] == 16)
+                    out.pool_ring[size_t(x) + size_t(y) * kLotArraySize] = 1;
+    }
     for (int y = 0; y < kLotArraySize; y++)
         for (int x = 0; x < kLotArraySize; x++) {
             uint16_t &f = out.floors[0][x + y * kLotArraySize];
             if (pools) {
                 uint8_t v = lot_cell(*pools, x, y)[0];
-                // 1-15 say which of a tile's corners are water; 16 is the dry ring round a pool. Taken
-                // for water, every pool was a tile too big all round, its ladders and boards standing
-                // in it and the spot behind a board "another room" (the Mashugas', 2026-11-02).
-                if (v != 0 && v != 255 && v != 16)
+                // (16 taken for water, every pool was a tile too big all round, its ladders and boards
+                // standing in it and the spot behind a board "another room": the Mashugas', 2026-11-02.)
+                if (v < 16 && (v != 0 || pools_written))
                     f = kFloorPool;
             }
             if (water) {
                 uint8_t v = lot_cell(*water, x, y)[0];
-                if (v != 0 && v != 255)
+                if (v != 255 && (v != 0 || water_written))
                     f = kFloorWater;
             }
         }
