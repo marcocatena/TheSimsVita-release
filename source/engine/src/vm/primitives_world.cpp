@@ -4360,6 +4360,8 @@ std::vector<std::pair<int16_t, std::string>> travel_lots(Vm &vm, int type)
     std::vector<std::pair<int16_t, std::string>> out;
     if (!vm.hood)
         return out;
+    if (TS_ENV("TS_NO_TRAVEL_LOTS"))   // debug: a chooser with nothing to offer (a neighbourhood without the area's lots)
+        return out;
     auto range = [&](int lo, int hi) {
         for (int h : vm.hood->houses) {
             auto zone = vm.hood->zoning.find(h);
@@ -5603,11 +5605,15 @@ Exit generic_call(Frame &f, const uint8_t *op)
                         friends_star_power(vm, so->person_data[31]));
         return changed ? Exit::GotoTrue : Exit::GotoFalse;
     }
-    case 35: {   // the stack object (a person, else the exe's error 0x1c) is the Studio Town traveller (sims.c 417980)
-        Entity *so = f.stack_object();
-        if (!so || !so->person)
+    case 35: {   // the caller (a person, else the exe's error 0x1c) is the Studio Town traveller (sims.c 417980)
+        // The exe tests the object running the code (in_ECX[0x47] + 0x12, its definition's type, 2 a person:
+        // in_ECX is "me", as case 0x11's trip), not the stack object. Ours asked the stack object: the limo's
+        // "Interaction - Go to Studio Lot" calls this with its phone plugin there, so the call was an error,
+        // the interaction ended at the kerb and nobody could go to Studio Town by car (v1.2, the players'
+        // reports of 2026-11-22/24).
+        if (!f.caller || !f.caller->person)
             return Exit::Error;
-        vm.studio_traveller = so->id;
+        vm.studio_traveller = f.caller->id;
         break;
     }
     case 42: {                                      // make the Sim in temp 0 the selected one

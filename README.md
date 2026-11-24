@@ -52,6 +52,9 @@ All taken on a PS Vita, at its own 960 × 544.
   `ux0:data/TheSimsVita/Downloads` (see [Files on the memory card](#files-on-the-memory-card)).
 - **Optional gameplay modifiers** (all off unless you choose them; see
   [Gameplay modifiers](#gameplay-modifiers)).
+- **A cover in RetroFlow Launcher:** if RetroFlow is installed, the game puts its cover in RetroFlow's
+  covers folder when it starts (a cover you've added yourself is kept). Rescan your games in RetroFlow
+  once to see it.
 
 ## What you need
 
@@ -202,6 +205,7 @@ it back.
 | `ux0:data/TheSimsVita/index.cache` | The index of the game's files (made again if deleted) |
 | `ux0:data/TheSimsVita/log.txt` | The last session's log; earlier ones are in `logs/` |
 | `ux0:data/TheSimsVita/ui/` | Optional: your own interface pictures, used instead of the built-in ones |
+| `ux0:data/RetroFlow/COVERS/Homebrew/TSVITA001.png` | Written by the app at start when RetroFlow Launcher is installed: the game's cover there (also in `Sony - PlayStation Vita/` if that folder exists) |
 
 ## Troubleshooting
 
